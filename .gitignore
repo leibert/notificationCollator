@@ -1,0 +1,5 @@
+.env
+/venv
+/.vscode
+nickPickle.dat
+*.sh
