@@ -3,7 +3,7 @@
 """
 Notification Collator Service
 
-This service integrates multiple notification sources (Signal, Home Assistant, SMS, Email)
+This service integrates multiple notification sources (Signal, Calendar)
 and displays them on an LED sign via MQTT. It also monitors calendar events and TODOs.
 
 Requirements:
@@ -22,7 +22,6 @@ import logging
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Any
 
-import asyncws
 import requests
 from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
@@ -47,11 +46,6 @@ logger.addHandler(handler)
 class Config:
     """Configuration class for environment variables and constants"""
     
-    # Home Assistant Configuration
-    HASS_TOKEN = os.environ.get('HASS_TOKEN')
-    HASS_HOST = os.environ.get('HASS_HOST')
-    HASS_PORT = int(os.environ.get('HASS_PORT', 8123))
-    
     # MQTT Configuration
     MQTT_BROKER = os.environ.get('MQTT_BROKER')
     MQTT_USER = os.environ.get('MQTT_USER')
@@ -59,13 +53,6 @@ class Config:
     
     # Calendar Scraper Configuration
     CAL_SCRAPER_HOST = os.environ.get('CAL_SCRAPER_HOST')
-    
-    # Monitored Home Assistant Entities
-    MONITORED_ENTITIES = [
-        "sensor.sm_s901u1_last_notification",
-        "sensor.sm_s901u1_active_notification_count",
-        "sensor.sm_s901u1_last_removed_notification"
-    ]
     
     # File paths
     NICK_PICKLE_FILE = 'nickPickle.dat'
@@ -172,144 +159,6 @@ class SignalHandler:
             self.glibcontext.iteration(False)
 
 
-class HomeAssistantMonitor:
-    """Monitors Home Assistant WebSocket for notifications"""
-    
-    def __init__(self, message_queue: List[Tuple]):
-        self.message_queue = message_queue
-        self.websocket = None
-    
-    async def connect(self) -> None:
-        """Establish WebSocket connection to Home Assistant"""
-        try:
-            self.websocket = await asyncws.connect(
-                f'ws://{Config.HASS_HOST}:{Config.HASS_PORT}/api/websocket'
-            )
-            
-            # Authenticate
-            await self.websocket.send(json.dumps({
-                'type': 'auth',
-                'access_token': Config.HASS_TOKEN
-            }))
-            
-            # Subscribe to state changes
-            await self.websocket.send(json.dumps({
-                'id': 1,
-                'type': 'subscribe_events',
-                'event_type': 'state_changed'
-            }))
-            
-            logger.info("Connected to Home Assistant WebSocket")
-            
-        except Exception as e:
-            logger.error(f"Failed to connect to Home Assistant: {e}")
-            await asyncio.sleep(300)
-            raise
-    
-    def _process_signal_notification(self, attributes: Dict) -> Optional[Tuple]:
-        """Process Signal notifications from Home Assistant"""
-        # Filter out status notifications
-        if (attributes.get('android.title') == 'Signal' and 
-            attributes.get('android.text') == 'Checking for messages…'):
-            return None
-        
-        return (
-            datetime.now(),
-            "Signal",
-            attributes.get('android.title', 'Unknown'),
-            attributes.get('android.text', '')
-        )
-    
-    def _process_sms_notification(self, attributes: Dict) -> Optional[Tuple]:
-        """Process SMS notifications from Home Assistant"""
-        sender = None
-        message_content = None
-        
-        # Handle different SMS notification formats
-        if 'android.messages' in attributes:
-            text_message = attributes['android.messages'].pop().split(", ")
-            if len(text_message) >= 4:
-                sender = text_message[2][7:]
-                message_content = text_message[3][5:]
-        
-        elif 'android.textLines' in attributes and attributes['android.textLines']:
-            text_message = attributes['android.textLines'][0].split("  ")
-            if len(text_message) >= 2:
-                sender = text_message[0]
-                message_content = text_message[1]
-        
-        if sender and message_content:
-            return (datetime.now(), "SMS", sender, message_content)
-        return None
-    
-    def _process_email_notification(self, attributes: Dict, email_type: str) -> Tuple:
-        """Process email notifications (Outlook/Fastmail)"""
-        title = attributes.get('android.title', 'No Subject')
-        return (datetime.now(), email_type, title, title)
-    
-    async def monitor(self) -> None:
-        """Monitor Home Assistant WebSocket for notifications"""
-        await self.connect()
-        
-        while True:
-            message = await self.websocket.recv()
-            
-            if message is None:
-                logger.warning("WebSocket connection lost, attempting restart")
-                await asyncio.sleep(10)
-                sys.exit()
-            
-            if "event" not in message:
-                continue
-            
-            try:
-                data = json.loads(message)['event']['data']
-                entity_id = data.get('entity_id')
-                
-                if entity_id not in Config.MONITORED_ENTITIES:
-                    continue
-                
-                if 'new_state' not in data or 'attributes' not in data['new_state']:
-                    continue
-                
-                attributes = data['new_state']['attributes']
-                package = attributes.get('package')
-                
-                notification = None
-                
-                # Process different notification types
-                if package == "org.thoughtcrime.securesms":
-                    # Signal notifications (legacy handler)
-                    logger.info("Signal notification detected (legacy handler)")
-                    continue
-                    
-                elif package == "com.google.android.apps.messaging":
-                    # SMS notifications
-                    notification = self._process_sms_notification(attributes)
-                    
-                elif package == "com.microsoft.office.outlook":
-                    # Outlook notifications
-                    notification = self._process_email_notification(attributes, "Outlook")
-                    
-                elif package == "com.fastmail.app":
-                    # Fastmail notifications
-                    notification = self._process_email_notification(attributes, "Fastmail")
-                    
-                elif package == "com.samsung.android.calendar":
-                    # Calendar notifications
-                    logger.info(f"Calendar event: {attributes}")
-                    
-                else:
-                    logger.info(f"Notification from unknown package: {package}")
-                
-                if notification:
-                    self.message_queue.append(notification)
-                    logger.info(f"Added notification to queue: {notification[1]} from {notification[2]}")
-                    
-            except Exception as e:
-                logger.error(f"Error processing Home Assistant message: {e}")
-
-
 class LEDSignController:
     """Controls the LED sign via MQTT"""
     
@@ -356,6 +205,9 @@ class CalendarManager:
     
     async def update_todos(self) -> None:
         """Fetch and publish TODO items"""
+        if not Config.CAL_SCRAPER_HOST:
+            return
+            
         todo_sources = [
             ("IBMLaptop_TODO", "nextTODO/work"),
             ("TO-DO_TODO", "nextTODO/personal")
@@ -394,6 +246,9 @@ class CalendarManager:
     
     async def update_schedule(self) -> None:
         """Fetch and process calendar schedule"""
+        if not Config.CAL_SCRAPER_HOST:
+            return
+            
         # Skip update if in countdown mode and event hasn't passed
         if (self.led_controller.current_mode == "eventCountdown" and 
             self.next_event.get("eventStart")):
@@ -548,7 +403,6 @@ class NotificationCollator:
         self.mqtt_client = self._setup_mqtt()
         self.led_controller = LEDSignController(self.mqtt_client)
         self.signal_handler = SignalHandler(self.message_queue)
-        self.hass_monitor = HomeAssistantMonitor(self.message_queue)
         self.calendar_manager = CalendarManager(self.mqtt_client, self.led_controller)
         self.message_processor = MessageProcessor(self.message_queue, self.led_controller)
     
@@ -594,7 +448,6 @@ class NotificationCollator:
         
         # Create async tasks
         tasks = [
-            asyncio.create_task(self.hass_monitor.monitor()),
             asyncio.create_task(self.signal_handler.monitor()),
             asyncio.create_task(self._update_todos_loop()),
             asyncio.create_task(self._update_schedule_loop()),
@@ -621,6 +474,24 @@ class NotificationCollator:
 def main():
     """Main entry point"""
     logger.info("Notification Collator starting...")
+    
+    # Check critical environment variables (MQTT is required)
+    critical_vars = {
+        'MQTT_BROKER': Config.MQTT_BROKER,
+        'MQTT_USER': Config.MQTT_USER,
+        'MQTT_PASSWORD': Config.MQTT_PASSWORD
+    }
+    
+    missing_critical = [var for var, value in critical_vars.items() if not value]
+    
+    if missing_critical:
+        logger.error(f"Missing critical environment variables: {', '.join(missing_critical)}")
+        logger.error("Please ensure MQTT variables are set in your .env file")
+        sys.exit(1)
+    
+    # Check optional environment variables
+    if not Config.CAL_SCRAPER_HOST:
+        logger.warning("CAL_SCRAPER_HOST not set - calendar features will be disabled")
     
     try:
         collator = NotificationCollator()
