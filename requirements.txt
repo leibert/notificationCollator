@@ -1,9 +1,7 @@
-pgi==0.0.11.2
-pycairo==1.22.0
-pydbus==0.6.0
-PyGObject==3.42.2
+dbus-next>=0.2.3
+paho-mqtt>=1.6.1
+python-dotenv>=0.19.0
+requests>=2.31.0
 ruamel.yaml==0.17.21
 ruamel.yaml.clib==0.2.7
-vext==0.7.6
-vext.gi==0.7.4
 wget==3.2
