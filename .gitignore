@@ -3,3 +3,6 @@
 /.vscode
 nickPickle.dat
 *.sh
+/old
+/__pycache__
+CLAUDE.md
