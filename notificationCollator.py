@@ -25,8 +25,9 @@ from typing import Dict, List, Tuple, Optional, Any
 import requests
 from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
-from gi.repository import GLib
-from pydbus import SystemBus
+from paho.mqtt.enums import CallbackAPIVersion
+from dbus_next.aio.message_bus import MessageBus
+from dbus_next.constants import BusType
 
 # Load environment variables
 load_dotenv()
@@ -65,15 +66,12 @@ class Config:
 
 class SignalHandler:
     """Handles Signal messaging integration via DBus"""
-    
+
     def __init__(self, message_queue: List[Tuple]):
         self.message_queue = message_queue
         self.nick_map = self._load_nick_map()
-        self.bus = SystemBus()
-        self.glibloop = GLib.MainLoop()
-        self.glibcontext = self.glibloop.get_context()
-        self.signal = self.bus.get("org.asamk.Signal", "/org/asamk/Signal/_17814134149")
-        self.signal.onMessageReceived = self.receive_message
+        self.bus = None
+        self.signal_interface = None
     
     def _load_nick_map(self) -> Dict[str, str]:
         """Load nickname mapping from pickle file"""
@@ -97,66 +95,116 @@ class SignalHandler:
     def _format_nickname(self, name: str) -> str:
         """Format a name into a valid nickname"""
         return name.replace(' ', '_').replace(':', '')
-    
-    def receive_message(self, timestamp: int, source: str, group_id: str, 
-                       message: str, attachments: List) -> None:
+
+    async def _initialize_dbus(self) -> None:
+        """Initialize DBus connection to Signal"""
+        try:
+            # Connect to system bus
+            self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+
+            # Get Signal service introspection
+            introspection = await self.bus.introspect('org.asamk.Signal', '/org/asamk/Signal/_17814134149')
+            proxy_object = self.bus.get_proxy_object('org.asamk.Signal', '/org/asamk/Signal/_17814134149', introspection)
+
+            # Get the Signal interface
+            self.signal_interface = proxy_object.get_interface('org.asamk.Signal')
+
+            # Subscribe to MessageReceived signal
+            # Signal signature: MessageReceived(x:timestamp, s:source, ay:groupId, s:message, as:attachments)
+            self.signal_interface.on_message_received(self._on_message_received)
+
+            logger.info("Signal DBus connection established")
+
+        except Exception as e:
+            logger.error(f"Error initializing DBus connection: {e}")
+            raise
+
+    def _on_message_received(self, timestamp: int, source: str, group_id: bytes,
+                            message: str, attachments: List) -> None:
         """
-        Process incoming Signal messages
-        
+        Callback for incoming Signal messages
+
         Args:
             timestamp: Message timestamp
             source: Sender's phone number
-            group_id: Group ID if message is from a group
+            group_id: Group ID if message is from a group (bytes array)
+            message: Message content
+            attachments: List of attachments
+        """
+        asyncio.create_task(self._process_message(timestamp, source, group_id, message, attachments))
+
+    async def _process_message(self, timestamp: int, source: str, group_id: bytes,
+                               message: str, attachments: List) -> None:
+        """
+        Process incoming Signal messages asynchronously
+
+        Args:
+            timestamp: Message timestamp
+            source: Sender's phone number
+            group_id: Group ID if message is from a group (bytes array)
             message: Message content
             attachments: List of attachments
         """
         try:
             logger.info(f"Signal message received from {source}")
-            
+
             nick_map_updated = False
-            
+
             # Get sender nickname
-            sending_user_name = self.signal.getContactName(source)
-            if sending_user_name:
-                from_nick = self._format_nickname(sending_user_name)
-                if from_nick not in self.nick_map:
-                    self.nick_map[from_nick] = source
-                    nick_map_updated = True
-            else:
+            try:
+                # type: ignore - call_get_contact_name is dynamically generated from DBus introspection
+                sending_user_name = await self.signal_interface.call_get_contact_name(source)  # type: ignore
+
+                if sending_user_name:
+                    from_nick = self._format_nickname(sending_user_name)
+                    if from_nick not in self.nick_map:
+                        self.nick_map[from_nick] = source
+                        nick_map_updated = True
+                else:
+                    from_nick = source
+            except Exception:
                 from_nick = source
-            
+
             # Handle group messages
-            if group_id:
-                group_name = self.signal.getGroupName(group_id)
-                group_name = 'GRP_' + self._format_nickname(group_name)
-                if group_name not in self.nick_map:
-                    self.nick_map[group_name] = group_id
-                    nick_map_updated = True
-                message = f"{from_nick}- {message}"
-                sender_name = group_name
+            if group_id and len(group_id) > 0:
+                try:
+                    # type: ignore - call_get_group_name is dynamically generated from DBus introspection
+                    group_name = await self.signal_interface.call_get_group_name(group_id)  # type: ignore
+
+                    group_name = 'GRP_' + self._format_nickname(group_name)
+                    group_id_str = group_id.hex() if isinstance(group_id, bytes) else str(group_id)
+                    if group_name not in self.nick_map:
+                        self.nick_map[group_name] = group_id_str
+                        nick_map_updated = True
+                    message = f"{from_nick}- {message}"
+                    sender_name = group_name
+                except Exception:
+                    sender_name = from_nick if from_nick else source
             else:
                 sender_name = from_nick if from_nick else source
-            
+
             # Save nick map if updated
             if nick_map_updated:
                 self._save_nick_map()
-            
+
             # Add to message queue
             sender_name = sender_name.replace("_", " ")
             self.message_queue.append((datetime.now(), "Signal", sender_name, message))
-            
+
             if attachments:
                 logger.info("Message contains attachments")
-                
+
         except Exception as e:
             logger.error(f"Error processing Signal message: {e}")
-    
+
     async def monitor(self) -> None:
         """Monitor Signal DBus for incoming messages"""
+        # Initialize DBus connection
+        await self._initialize_dbus()
+
+        # Keep the monitor running
         while True:
-            await asyncio.sleep(0.1)
-            # False is needed to keep the thread from getting trapped
-            self.glibcontext.iteration(False)
+            await asyncio.sleep(1)
 
 
 class LEDSignController:
@@ -207,25 +255,19 @@ class CalendarManager:
         """Fetch and publish TODO items"""
         if not Config.CAL_SCRAPER_HOST:
             return
-            
-        todo_sources = [
-            ("IBMLaptop_TODO", "nextTODO/work"),
-            ("TO-DO_TODO", "nextTODO/personal")
-        ]
-        
-        for source, topic in todo_sources:
-            try:
-                headers = {"mode": "getCalendar", "calSource": source}
-                result = requests.get(Config.CAL_SCRAPER_HOST, headers=headers)
-                todo_list = self._parse_calendar_response(result.text)
-                
-                if len(todo_list) > 1:
-                    # Get next todo and trim extra info
-                    todo = todo_list[1].split(',')[0]
-                    self.client.publish(topic, todo)
-                    
-            except Exception as e:
-                logger.error(f"Error updating TODOs from {source}: {e}")
+
+        try:
+            headers = {"mode": "getCalendar", "calSource": "TO-DO_TODO"}
+            result = requests.get(Config.CAL_SCRAPER_HOST, headers=headers)
+            todo_list = self._parse_calendar_response(result.text)
+
+            if len(todo_list) > 1:
+                # Get next todo and trim extra info
+                todo = todo_list[1].split(',')[0]
+                self.client.publish("nextTODO/personal", todo)
+
+        except Exception as e:
+            logger.error(f"Error updating personal TODO: {e}")
     
     def reset_next_event(self) -> None:
         """Reset next event data"""
@@ -258,7 +300,7 @@ class CalendarManager:
                 return
         
         try:
-            headers = {"mode": "getCalendar", "calSource": "IBMLaptop"}
+            headers = {"mode": "getCalendar", "calSource": "calendarEvents"}
             result = requests.get(Config.CAL_SCRAPER_HOST, headers=headers)
             schedule = self._parse_calendar_response(result.text)
             
@@ -267,7 +309,7 @@ class CalendarManager:
             event_start = None
             
             while len(schedule) > 1:
-                schedule = schedule[1:]
+                # schedule = schedule[1:]
                 event_data = schedule[0].split(",")
                 
                 # Parse event timestamp
@@ -310,7 +352,7 @@ class CalendarManager:
             self.client.publish("nextEvent/attendees", attendees)
         
         # Check for external attendees
-        is_external = len(event) > 5 and "EXTATTENDEES" in event[5]
+        is_external = len(event) > 5 and "EXTATTENDEES" in event[6]
         self.next_event['isExternal'] = is_external
         self.client.publish("nextEvent/isExternal", is_external)
     
@@ -408,7 +450,7 @@ class NotificationCollator:
     
     def _setup_mqtt(self) -> mqtt.Client:
         """Setup MQTT client with callbacks"""
-        client = mqtt.Client("HASS_messageprocessor")
+        client = mqtt.Client(client_id="HASS_messageprocessor", callback_api_version=CallbackAPIVersion.VERSION1)
         client.username_pw_set(Config.MQTT_USER, password=Config.MQTT_PASSWORD)
         
         client.on_connect = self._on_mqtt_connect
