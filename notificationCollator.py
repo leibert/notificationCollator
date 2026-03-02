@@ -19,10 +19,12 @@ import json
 import pickle
 import asyncio
 import logging
+import traceback
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Any
 
 import requests
+from requests.exceptions import RequestException
 from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
@@ -62,6 +64,13 @@ class Config:
     BASE_MESSAGE_DISPLAY_TIME = 6
     EXTRA_TIME_PER_CHAR = 0.75
     MESSAGE_LENGTH_THRESHOLD = 16
+    
+    # Connection timeouts and retries
+    HTTP_REQUEST_TIMEOUT = 10  # seconds
+    DBUS_RECONNECT_DELAY = 5  # seconds
+    DBUS_MAX_RETRIES = 3
+    MQTT_RECONNECT_DELAY = 5  # seconds
+    TASK_MONITORING_INTERVAL = 10  # seconds
 
 
 class SignalHandler:
@@ -97,27 +106,46 @@ class SignalHandler:
         return name.replace(' ', '_').replace(':', '')
 
     async def _initialize_dbus(self) -> None:
-        """Initialize DBus connection to Signal"""
-        try:
-            # Connect to system bus
-            self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        """Initialize DBus connection to Signal with retry logic"""
+        for attempt in range(Config.DBUS_MAX_RETRIES):
+            try:
+                # Connect to system bus
+                self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+                logger.info("DBus system bus connection established")
 
-            # Get Signal service introspection
-            introspection = await self.bus.introspect('org.asamk.Signal', '/org/asamk/Signal/_17814134149')
-            proxy_object = self.bus.get_proxy_object('org.asamk.Signal', '/org/asamk/Signal/_17814134149', introspection)
+                # Get Signal service introspection
+                try:
+                    introspection = await self.bus.introspect('org.asamk.Signal', '/org/asamk/Signal/_17814134149')
+                    proxy_object = self.bus.get_proxy_object('org.asamk.Signal', '/org/asamk/Signal/_17814134149', introspection)
 
-            # Get the Signal interface
-            self.signal_interface = proxy_object.get_interface('org.asamk.Signal')
+                    # Get the Signal interface
+                    self.signal_interface = proxy_object.get_interface('org.asamk.Signal')
 
-            # Subscribe to MessageReceived signal
-            # Signal signature: MessageReceived(x:timestamp, s:source, ay:groupId, s:message, as:attachments)
-            self.signal_interface.on_message_received(self._on_message_received)
+                    # Subscribe to MessageReceived signal
+                    # Signal signature: MessageReceived(x:timestamp, s:source, ay:groupId, s:message, as:attachments)
+                    self.signal_interface.on_message_received(self._on_message_received)
 
-            logger.info("Signal DBus connection established")
+                    logger.info("Signal DBus interface connected and monitoring for messages")
+                    return
 
-        except Exception as e:
-            logger.error(f"Error initializing DBus connection: {e}")
-            raise
+                except Exception as e:
+                    logger.error(f"Failed to connect Signal interface: {e}")
+                    if attempt < Config.DBUS_MAX_RETRIES - 1:
+                        logger.info(f"Retrying Signal connection in {Config.DBUS_RECONNECT_DELAY}s (attempt {attempt + 1}/{Config.DBUS_MAX_RETRIES})")
+                        await asyncio.sleep(Config.DBUS_RECONNECT_DELAY)
+                    else:
+                        raise
+
+            except Exception as e:
+                logger.error(f"DBus connection failed (attempt {attempt + 1}/{Config.DBUS_MAX_RETRIES}): {e}")
+                logger.debug(f"Full traceback: {traceback.format_exc()}")
+                
+                if attempt < Config.DBUS_MAX_RETRIES - 1:
+                    logger.info(f"Retrying in {Config.DBUS_RECONNECT_DELAY}s...")
+                    await asyncio.sleep(Config.DBUS_RECONNECT_DELAY)
+                else:
+                    logger.critical("Failed to initialize Signal DBus connection after all retries")
+                    raise
 
     def _on_message_received(self, timestamp: int, source: str, group_id: bytes,
                             message: str, attachments: List) -> None:
@@ -146,9 +174,10 @@ class SignalHandler:
             attachments: List of attachments
         """
         try:
-            logger.info(f"Signal message received from {source}")
+            logger.info(f"Signal message received from {source}, length={len(message)}, attachments={len(attachments) if attachments else 0}")
 
             nick_map_updated = False
+            from_nick = source
 
             # Get sender nickname
             try:
@@ -160,12 +189,15 @@ class SignalHandler:
                     if from_nick not in self.nick_map:
                         self.nick_map[from_nick] = source
                         nick_map_updated = True
+                        logger.debug(f"Stored new nick mapping: {from_nick} -> {source}")
                 else:
-                    from_nick = source
-            except Exception:
+                    logger.debug(f"No contact name found for {source}")
+            except Exception as e:
+                logger.warning(f"Failed to get contact name for {source}: {e}")
                 from_nick = source
 
             # Handle group messages
+            sender_name = from_nick
             if group_id and len(group_id) > 0:
                 try:
                     # type: ignore - call_get_group_name is dynamically generated from DBus introspection
@@ -176,35 +208,49 @@ class SignalHandler:
                     if group_name not in self.nick_map:
                         self.nick_map[group_name] = group_id_str
                         nick_map_updated = True
+                        logger.debug(f"Stored new group mapping: {group_name} -> {group_id_str}")
                     message = f"{from_nick}- {message}"
                     sender_name = group_name
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"Failed to get group name for {group_id.hex() if isinstance(group_id, bytes) else group_id}: {e}")
                     sender_name = from_nick if from_nick else source
-            else:
-                sender_name = from_nick if from_nick else source
 
             # Save nick map if updated
             if nick_map_updated:
-                self._save_nick_map()
+                try:
+                    self._save_nick_map()
+                    logger.debug("Nick map saved to disk")
+                except Exception as e:
+                    logger.error(f"Failed to save nick map: {e}")
 
             # Add to message queue
             sender_name = sender_name.replace("_", " ")
             self.message_queue.append((datetime.now(), "Signal", sender_name, message))
+            logger.info(f"Message queued: {sender_name}")
 
             if attachments:
-                logger.info("Message contains attachments")
+                logger.debug(f"Message contains {len(attachments)} attachments")
 
         except Exception as e:
             logger.error(f"Error processing Signal message: {e}")
+            logger.debug(f"Full traceback: {traceback.format_exc()}")
 
     async def monitor(self) -> None:
         """Monitor Signal DBus for incoming messages"""
         # Initialize DBus connection
         await self._initialize_dbus()
+        logger.info("Signal handler monitoring started")
 
         # Keep the monitor running
-        while True:
-            await asyncio.sleep(1)
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"Signal monitor encountered error: {e}")
+            logger.debug(f"Full traceback: {traceback.format_exc()}")
+            # Attempt to reinitialize on error
+            logger.info("Attempting to reinitialize Signal connection...")
+            await self.monitor()
 
 
 class LEDSignController:
@@ -257,17 +303,22 @@ class CalendarManager:
             return
 
         try:
-            headers = {"mode": "getCalendar", "calSource": "TO-DO_TODO"}
-            result = requests.get(Config.CAL_SCRAPER_HOST, headers=headers)
+            headers = {"mode": "getCalendar", "calSource": "calendar_TODO"}
+            result = requests.get(Config.CAL_SCRAPER_HOST, headers=headers, timeout=Config.HTTP_REQUEST_TIMEOUT)
+            result.raise_for_status()
             todo_list = self._parse_calendar_response(result.text)
 
             if len(todo_list) > 1:
                 # Get next todo and trim extra info
                 todo = todo_list[1].split(',')[0]
                 self.client.publish("nextTODO/personal", todo)
+                logger.debug(f"Published TODO: {todo}")
 
+        except RequestException as e:
+            logger.warning(f"Failed to fetch TODOs from calendar scraper: {e}")
         except Exception as e:
             logger.error(f"Error updating personal TODO: {e}")
+            logger.debug(f"Full traceback: {traceback.format_exc()}")
     
     def reset_next_event(self) -> None:
         """Reset next event data"""
@@ -295,13 +346,17 @@ class CalendarManager:
         if (self.led_controller.current_mode == "eventCountdown" and 
             self.next_event.get("eventStart")):
             
-            event_time = datetime.fromtimestamp(self.next_event['eventStart'])
-            if datetime.now() < event_time or (datetime.now() - event_time).seconds < 120:
-                return
+            try:
+                event_time = datetime.fromtimestamp(self.next_event['eventStart'])
+                if datetime.now() < event_time or (datetime.now() - event_time).seconds < 120:
+                    return
+            except (KeyError, ValueError, TypeError) as e:
+                logger.warning(f"Invalid event start time in next_event: {e}")
         
         try:
             headers = {"mode": "getCalendar", "calSource": "calendarEvents"}
-            result = requests.get(Config.CAL_SCRAPER_HOST, headers=headers)
+            result = requests.get(Config.CAL_SCRAPER_HOST, headers=headers, timeout=Config.HTTP_REQUEST_TIMEOUT)
+            result.raise_for_status()
             schedule = self._parse_calendar_response(result.text)
             
             # Find next valid event
@@ -329,32 +384,42 @@ class CalendarManager:
             else:
                 self.reset_next_event()
                 
+        except RequestException as e:
+            logger.warning(f"Failed to fetch schedule from calendar scraper: {e}")
         except Exception as e:
             logger.error(f"Error updating schedule: {e}")
+            logger.debug(f"Full traceback: {traceback.format_exc()}")
     
     def _process_event(self, event: List[str], event_start: datetime) -> None:
         """Process and publish calendar event details"""
-        self.next_event['eventStart'] = event_start.timestamp()
-        self.client.publish("nextEvent/timeStamp", self.next_event['eventStart'])
-        
-        self.next_event['eventSubject'] = event[2].strip()
-        self.client.publish("nextEvent/subject", self.next_event['eventSubject'])
-        
-        self.next_event['eventOrganizer'] = event[3].strip()
-        self.client.publish("nextEvent/organizer", self.next_event['eventOrganizer'])
-        
-        # Process attendees if available
-        if len(event) > 4:
-            attendees = event[4].strip()
-            if len(attendees) > 200:
-                attendees = attendees[:200] + "....."
-            self.next_event['eventAttendees'] = attendees
-            self.client.publish("nextEvent/attendees", attendees)
-        
-        # Check for external attendees
-        is_external = len(event) > 5 and "EXTATTENDEES" in event[6]
-        self.next_event['isExternal'] = is_external
-        self.client.publish("nextEvent/isExternal", is_external)
+        try:
+            self.next_event['eventStart'] = event_start.timestamp()
+            self.client.publish("nextEvent/timeStamp", self.next_event['eventStart'])
+            
+            self.next_event['eventSubject'] = event[2].strip() if len(event) > 2 else "Unknown"
+            self.client.publish("nextEvent/subject", self.next_event['eventSubject'])
+            
+            self.next_event['eventOrganizer'] = event[3].strip() if len(event) > 3 else "Unknown"
+            self.client.publish("nextEvent/organizer", self.next_event['eventOrganizer'])
+            
+            # Process attendees if available
+            if len(event) > 4:
+                attendees = event[4].strip()
+                if len(attendees) > 200:
+                    attendees = attendees[:200] + "....."
+                self.next_event['eventAttendees'] = attendees
+                self.client.publish("nextEvent/attendees", attendees)
+            
+            # Check for external attendees
+            is_external = len(event) > 5 and "EXTATTENDEES" in event[5]
+            self.next_event['isExternal'] = is_external
+            self.client.publish("nextEvent/isExternal", is_external)
+            
+            logger.info(f"Event published: {self.next_event['eventSubject']} at {event_start}")
+        except (IndexError, ValueError, TypeError) as e:
+            logger.error(f"Error parsing event data: {e}, event data: {event}")
+            logger.debug(f"Full traceback: {traceback.format_exc()}")
+            self.reset_next_event()
     
     async def monitor_schedule(self) -> None:
         """Monitor schedule for upcoming events and trigger alerts"""
@@ -373,7 +438,7 @@ class CalendarManager:
                     if (self.led_controller.current_mode != "eventCountdown" or 
                         seconds_until % 10 == 0):
                         
-                        logger.info(f"Event alert: {self.next_event.get('eventSubject', 'Unknown')}")
+                        logger.info(f"Event countdown: {seconds_until}s until {self.next_event.get('eventSubject', 'Unknown')}")
                         self.led_controller.set_mode("eventCountdown")
                         
                         # Activate beacon light for external meetings
@@ -393,8 +458,12 @@ class CalendarManager:
                 if (event_time - datetime.now()).seconds < 3 or datetime.now() > event_time:
                     self.client.publish("beaconLight/activate", False)
                     
+            except (KeyError, ValueError, TypeError) as e:
+                logger.warning(f"Invalid event data in monitor_schedule: {e}")
+                self.reset_next_event()
             except Exception as e:
                 logger.error(f"Error monitoring schedule: {e}")
+                logger.debug(f"Full traceback: {traceback.format_exc()}")
 
 
 class MessageProcessor:
@@ -424,17 +493,23 @@ class MessageProcessor:
                 # Get next message from queue
                 timestamp, msg_type, sender, text = self.message_queue.pop(0)
                 
-                logger.info(f"Displaying message: {msg_type} from {sender}")
+                logger.info(f"Processing message: {msg_type} from {sender} ({len(text)} chars)")
                 
                 # Display message on LED sign
                 self.led_controller.display_message(msg_type, sender, text)
                 
                 # Calculate and wait for display time
                 display_time = self.led_controller.calculate_display_time(text)
+                logger.debug(f"Message display time: {display_time:.1f}s")
                 await asyncio.sleep(display_time)
                 
+            except ValueError as e:
+                logger.error(f"Error unpacking message from queue: {e}, message: {self.message_queue[0] if self.message_queue else 'queue empty'}")
+                if self.message_queue:
+                    self.message_queue.pop(0)  # Skip malformed message
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
+                logger.debug(f"Full traceback: {traceback.format_exc()}")
 
 
 class NotificationCollator:
@@ -461,44 +536,72 @@ class NotificationCollator:
     
     def _on_mqtt_connect(self, client, userdata, flags, rc):
         """MQTT connection callback"""
-        logger.info(f"Connected to MQTT broker with result code {rc}")
+        if rc == 0:
+            logger.info("Successfully connected to MQTT broker")
+        else:
+            logger.error(f"Connected to MQTT broker with error code {rc}")
     
     def _on_mqtt_disconnect(self, client, userdata, rc):
         """MQTT disconnection callback"""
-        logger.error(f"Disconnected from MQTT broker with code {rc}")
-        time.sleep(5)
-        logger.info("Restarting application...")
-        os.execv(sys.executable, [sys.executable, __file__] + sys.argv)
+        if rc != 0:
+            logger.error(f"Unexpected disconnect from MQTT broker with code {rc}")
+        else:
+            logger.info(f"Gracefully disconnected from MQTT broker")
+        logger.info(f"MQTT client will attempt automatic reconnection (unexpected={rc != 0})")
     
     def _on_mqtt_connect_fail(self, client, userdata):
         """MQTT connection failure callback"""
-        logger.error("Failed to connect to MQTT broker")
-        time.sleep(5)
-        logger.info("Restarting application...")
-        os.execv(sys.executable, [sys.executable, __file__] + sys.argv)
+        logger.error("Failed to connect to MQTT broker, will retry...")
     
     async def run(self):
         """Run the notification collator"""
         logger.info("Starting Notification Collator")
         
-        # Connect to MQTT
-        self.mqtt_client.connect(Config.MQTT_BROKER, 1883)
-        self.mqtt_client.loop_start()
+        try:
+            # Connect to MQTT
+            logger.info(f"Connecting to MQTT broker at {Config.MQTT_BROKER}:1883")
+            self.mqtt_client.connect(Config.MQTT_BROKER, 1883)
+            self.mqtt_client.loop_start()
+            logger.info("MQTT client loop started")
+            
+            # Reset LED sign to clock mode
+            self.led_controller.set_mode("bigClock")
+            
+            # Create async tasks
+            tasks = {
+                "signal_monitor": asyncio.create_task(self.signal_handler.monitor()),
+                "todos_loop": asyncio.create_task(self._update_todos_loop()),
+                "schedule_loop": asyncio.create_task(self._update_schedule_loop()),
+                "schedule_monitor": asyncio.create_task(self.calendar_manager.monitor_schedule()),
+                "message_processor": asyncio.create_task(self.message_processor.process_messages())
+            }
+            
+            logger.info(f"Started {len(tasks)} async tasks")
+            
+            # Monitor tasks for failures
+            asyncio.create_task(self._monitor_tasks(tasks))
+            
+            # Wait for all tasks
+            await asyncio.gather(*tasks.values())
         
-        # Reset LED sign to clock mode
-        self.led_controller.set_mode("bigClock")
-        
-        # Create async tasks
-        tasks = [
-            asyncio.create_task(self.signal_handler.monitor()),
-            asyncio.create_task(self._update_todos_loop()),
-            asyncio.create_task(self._update_schedule_loop()),
-            asyncio.create_task(self.calendar_manager.monitor_schedule()),
-            asyncio.create_task(self.message_processor.process_messages())
-        ]
-        
-        # Wait for all tasks
-        await asyncio.gather(*tasks)
+        except KeyboardInterrupt:
+            logger.info("Shutting down on keyboard interrupt")
+        except Exception as e:
+            logger.error(f"Fatal error in main loop: {e}")
+            logger.debug(f"Full traceback: {traceback.format_exc()}")
+            raise
+    
+    async def _monitor_tasks(self, tasks: Dict[str, asyncio.Task]) -> None:
+        """Monitor async tasks and log if any fail"""
+        while True:
+            await asyncio.sleep(Config.TASK_MONITORING_INTERVAL)
+            for name, task in tasks.items():
+                if task.done():
+                    try:
+                        task.result()  # This will raise if the task failed
+                    except Exception as e:
+                        logger.error(f"Task '{name}' has failed: {e}")
+                        logger.debug(f"Full traceback: {task.get_traceback() if hasattr(task, 'get_traceback') else 'N/A'}")
     
     async def _update_todos_loop(self):
         """Periodic TODO update loop"""
@@ -515,7 +618,9 @@ class NotificationCollator:
 
 def main():
     """Main entry point"""
+    logger.info("="*80)
     logger.info("Notification Collator starting...")
+    logger.info("="*80)
     
     # Check critical environment variables (MQTT is required)
     critical_vars = {
@@ -535,16 +640,26 @@ def main():
     if not Config.CAL_SCRAPER_HOST:
         logger.warning("CAL_SCRAPER_HOST not set - calendar features will be disabled")
     
+    logger.info(f"Configuration loaded:")
+    logger.info(f"  MQTT_BROKER: {Config.MQTT_BROKER}")
+    logger.info(f"  CAL_SCRAPER_HOST: {Config.CAL_SCRAPER_HOST or 'disabled'}")
+    logger.info(f"  HTTP_TIMEOUT: {Config.HTTP_REQUEST_TIMEOUT}s")
+    logger.info(f"  DBUS_RETRIES: {Config.DBUS_MAX_RETRIES}")
+    
     try:
         collator = NotificationCollator()
         asyncio.run(collator.run())
-    except ConnectionRefusedError:
-        logger.error("Connection refused error")
+    except ConnectionRefusedError as e:
+        logger.error(f"Connection refused: {e}")
+        logger.debug(f"Full traceback: {traceback.format_exc()}")
+        sys.exit(1)
     except KeyboardInterrupt:
         logger.info("Shutting down...")
+        sys.exit(0)
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        raise
+        logger.error(f"Unexpected fatal error: {e}")
+        logger.debug(f"Full traceback: {traceback.format_exc()}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
