@@ -143,6 +143,10 @@ The service publishes to the following MQTT topics:
 - `nextTODO/work` - Next work TODO item
 - `nextTODO/personal` - Next personal TODO item
 
+**Rotation Control**
+- Publish `next` or `prev` to `nextTODO/select` to cycle through the loaded personal TODO list.
+  The currently selected TODO will be republished to `nextTODO/personal`.
+
 ### Other
 - `beaconLight/activate` - Activate beacon for external meetings
 
