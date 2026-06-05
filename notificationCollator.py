@@ -112,6 +112,8 @@ class SignalHandler:
         self.bus = None
         self.signal_interface = None
         self.last_message_time: Optional[datetime] = None
+        # Stored after _initialize_dbus succeeds; used for callback arity detection
+        self._signal_introspection = None
 
     def _load_nick_map(self) -> Dict[str, str]:
         """Load nickname mapping from pickle file"""
@@ -194,6 +196,7 @@ class SignalHandler:
                         raise RuntimeError('Unable to locate org.asamk.Signal object path')
 
                     introspection = await self.bus.introspect('org.asamk.Signal', object_path)
+                    self._signal_introspection = introspection  # saved for arity detection
                     proxy_object = self.bus.get_proxy_object('org.asamk.Signal', object_path, introspection)
                     self.signal_interface = proxy_object.get_interface('org.asamk.Signal')
                     await self._register_signal_handlers()
@@ -228,9 +231,13 @@ class SignalHandler:
     async def _register_signal_handlers(self) -> None:
         """Subscribe to Signal receive events and register incoming message callbacks.
 
-        Uses a single variadic (*args) wrapper instead of fixed-arity wrappers so that
-        arity mismatches between dbus_next signal definitions and our callbacks never
-        cause a silent TypeError that drops messages.
+        dbus_next validates callback arity at registration time using inspect —
+        it rejects *args functions.  We introspect each signal's type signature
+        to discover the exact parameter count, then use _make_dbus_callback() to
+        generate a wrapper with precisely that many positional parameters.
+
+        Sync message signals are intentionally excluded: signal-cli fires them
+        for messages the local account *sends*, which should not appear on the sign.
         """
         if hasattr(self.signal_interface, 'call_subscribe_receive'):
             try:
@@ -244,13 +251,10 @@ class SignalHandler:
                 "relying on passive message events"
             )
 
-        def make_variadic_wrapper(signal_name: str):
-            """Return a *args callback that logs arity and delegates to the processor."""
-            def cb(*args):
-                logger.debug(f"[{signal_name}] Raw D-Bus event received: {len(args)} args")
-                task = asyncio.create_task(self._process_signal_event(*args))
-                task.add_done_callback(self._on_message_task_done)
-            return cb
+        # Build arity map from introspection so each callback has the exact
+        # number of positional parameters dbus_next expects.
+        arity_map = self._build_signal_arity_map()
+        logger.debug(f"Signal arity map from introspection: {arity_map}")
 
         handlers = []
         for signal_name in [
@@ -262,14 +266,88 @@ class SignalHandler:
             # outgoing messages onto the LED sign.
         ]:
             signal_slot = getattr(self.signal_interface, signal_name, None)
-            if callable(signal_slot):
-                signal_slot(make_variadic_wrapper(signal_name))
-                handlers.append(signal_name)
+            if not callable(signal_slot):
+                continue
+
+            n_args = arity_map.get(signal_name)
+            if n_args is None:
+                logger.warning(
+                    f"Could not determine arity for '{signal_name}' from introspection; "
+                    f"falling back to 5 parameters (standard MessageReceived signature)"
+                )
+                n_args = 5
+
+            cb = self._make_dbus_callback(n_args, signal_name)
+            signal_slot(cb)
+            handlers.append(f"{signal_name}({n_args} args)")
 
         if not handlers:
             raise AttributeError('Signal interface does not expose any incoming message events')
 
         logger.info(f"Registered Signal callbacks for: {', '.join(handlers)}")
+
+    # ------------------------------------------------------------------
+    # Callback arity helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pascal_to_snake(name: str) -> str:
+        """Convert PascalCase to snake_case (e.g. MessageReceived -> message_received)."""
+        result = []
+        for i, ch in enumerate(name):
+            if ch.isupper() and i > 0:
+                result.append('_')
+            result.append(ch.lower())
+        return ''.join(result)
+
+    def _build_signal_arity_map(self) -> Dict[str, int]:
+        """Return a map of dbus_next on_xxx property name -> D-Bus arg count.
+
+        Reads signal definitions from the introspection data captured during
+        _initialize_dbus.  Returns an empty dict if introspection is unavailable.
+        """
+        arity_map: Dict[str, int] = {}
+        if self._signal_introspection is None:
+            logger.warning("No introspection data available for arity detection")
+            return arity_map
+
+        for iface in getattr(self._signal_introspection, 'interfaces', []):
+            if getattr(iface, 'name', '') != 'org.asamk.Signal':
+                continue
+            for sig in getattr(iface, 'signals', []):
+                prop_name = 'on_' + self._pascal_to_snake(sig.name)
+                n = len(getattr(sig, 'args', []))
+                arity_map[prop_name] = n
+                logger.debug(f"  introspected: {sig.name} -> {prop_name} ({n} args)")
+
+        return arity_map
+
+    def _make_dbus_callback(self, n_args: int, signal_name: str):
+        """Generate a callback with exactly n_args positional parameters.
+
+        dbus_next uses inspect.getfullargspec to validate that the registered
+        callback has the correct number of positional parameters.  A *args
+        function does not satisfy this check.  We use exec() to produce a
+        function with a precise, statically-known signature at call time.
+        """
+        param_names = ', '.join(f'_p{i}' for i in range(n_args))
+        globs: Dict[str, Any] = {
+            '_asyncio': asyncio,
+            '_logger': logger,
+            '_process': self._process_signal_event,
+            '_done_cb': self._on_message_task_done,
+            '_sname': signal_name,
+            '_n': n_args,
+        }
+        exec(
+            f"def _cb({param_names}):\n"
+            f"    _logger.debug('[%s] D-Bus event: {n_args} args', _sname)\n"
+            f"    _t = _asyncio.create_task(_process({param_names}))\n"
+            f"    _t.add_done_callback(_done_cb)\n",
+            globs,
+        )
+        return globs['_cb']
+
 
     def _on_signal_event(self, *args) -> None:
         """Generic callback for incoming Signal DBus events."""
