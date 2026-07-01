@@ -744,6 +744,7 @@ class NotificationCollator:
     """Main application class that coordinates all components"""
     
     def __init__(self):
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.message_queue: asyncio.Queue[Tuple[datetime, str, str, str]] = asyncio.Queue()
         self.mqtt_connected = asyncio.Event()
         self.mqtt_client = self._setup_mqtt()
@@ -764,19 +765,32 @@ class NotificationCollator:
         client.on_message = self._on_mqtt_message
         
         return client
+
+    def _set_mqtt_connected(self, value: bool) -> None:
+        """Helper to thread-safely set or clear the mqtt_connected event."""
+        if self.loop and self.loop.is_running():
+            if value:
+                self.loop.call_soon_threadsafe(self.mqtt_connected.set)
+            else:
+                self.loop.call_soon_threadsafe(self.mqtt_connected.clear)
+        else:
+            if value:
+                self.mqtt_connected.set()
+            else:
+                self.mqtt_connected.clear()
     
     def _on_mqtt_connect(self, client, userdata, flags, rc):
         """MQTT connection callback"""
         if rc == 0:
             logger.info("Successfully connected to MQTT broker")
-            self.mqtt_connected.set()
+            self._set_mqtt_connected(True)
         else:
             logger.error(f"Connected to MQTT broker with error code {rc}")
-            self.mqtt_connected.clear()
+            self._set_mqtt_connected(False)
     
     def _on_mqtt_disconnect(self, client, userdata, rc):
         """MQTT disconnection callback"""
-        self.mqtt_connected.clear()
+        self._set_mqtt_connected(False)
         if rc != 0:
             logger.error(f"Unexpected disconnect from MQTT broker with code {rc}")
         else:
@@ -785,7 +799,7 @@ class NotificationCollator:
     
     def _on_mqtt_connect_fail(self, client, userdata):
         """MQTT connection failure callback"""
-        self.mqtt_connected.clear()
+        self._set_mqtt_connected(False)
         logger.error("Failed to connect to MQTT broker, will retry...")
 
     def _on_mqtt_message(self, client, userdata, msg):
@@ -799,8 +813,41 @@ class NotificationCollator:
         else:
             logger.debug(f"No handler for topic {topic}")
     
+    async def _mqtt_monitor_loop(self) -> None:
+        """Monitor MQTT connection and force reconnection if it stays disconnected."""
+        logger.info("MQTT monitor loop started")
+        while True:
+            await asyncio.sleep(Config.MQTT_RECONNECT_DELAY)
+
+            # Check connection status using the client's internal status
+            is_connected = False
+            try:
+                is_connected = self.mqtt_client.is_connected()
+            except Exception as e:
+                logger.error(f"Error checking MQTT connection status: {e}")
+
+            if not is_connected:
+                # If the library thinks it's not connected, ensure our event is cleared
+                if self.mqtt_connected.is_set():
+                    logger.warning("MQTT client reporting disconnected but event was set. Clearing event.")
+                    self._set_mqtt_connected(False)
+
+                logger.warning("MQTT monitor detected client is disconnected. Attempting manual reconnect...")
+                try:
+                    # Run the blocking reconnect call in a thread pool so we don't block the asyncio event loop
+                    await asyncio.to_thread(self.mqtt_client.reconnect)
+                    logger.info("MQTT manual reconnect call initiated successfully")
+                except Exception as e:
+                    logger.error(f"MQTT manual reconnect attempt failed: {e}")
+            else:
+                # Connected! Ensure the event is set
+                if not self.mqtt_connected.is_set():
+                    logger.info("MQTT client is connected but event was not set. Setting event.")
+                    self._set_mqtt_connected(True)
+
     async def run(self):
         """Run the notification collator"""
+        self.loop = asyncio.get_running_loop()
         logger.info("Starting Notification Collator")
         
         try:
@@ -809,11 +856,12 @@ class NotificationCollator:
             try:
                 if not Config.MQTT_BROKER:
                     raise RuntimeError('MQTT broker host is not configured')
-                self.mqtt_client.connect(Config.MQTT_BROKER, 1883)
+                self.mqtt_client.reconnect_delay_set(min_delay=1, max_delay=30)
+                self.mqtt_client.connect_async(Config.MQTT_BROKER, 1883)
                 self.mqtt_client.loop_start()
-                logger.info("MQTT client loop started")
+                logger.info("MQTT client loop started (connecting asynchronously)")
             except Exception as e:
-                logger.error(f"MQTT connection attempt failed: {e}")
+                logger.error(f"MQTT connection setup failed: {e}")
                 # continue, other components may still operate
 
             # subscribe to command topics (safe even if not connected immediately)
@@ -835,7 +883,8 @@ class NotificationCollator:
                 "todos_loop": asyncio.create_task(self._update_todos_loop()),
                 "schedule_loop": asyncio.create_task(self._update_schedule_loop()),
                 "schedule_monitor": asyncio.create_task(self.calendar_manager.monitor_schedule()),
-                "message_processor": asyncio.create_task(self.message_processor.process_messages())
+                "message_processor": asyncio.create_task(self.message_processor.process_messages()),
+                "mqtt_monitor": asyncio.create_task(self._mqtt_monitor_loop())
             }
             
             logger.info(f"Started {len(tasks)} async tasks: {list(tasks.keys())}")
