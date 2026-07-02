@@ -1211,6 +1211,28 @@ class NotificationCollator:
         await self._add_todoist_comment(todoist_id, comment_content)
         await self._complete_todoist_task(todoist_id)
 
+    def _handle_start(self) -> None:
+        logger.info("Pausing text messages/interrupts to the sign.")
+        self.led_controller.paused_event.clear()
+
+    def _handle_stop(self) -> None:
+        logger.info("Resuming all messages to MQTT, adding comment to Todoist.")
+        self.led_controller.paused_event.set()
+        todoist_id = self._get_current_todoist_id()
+        if todoist_id:
+            asyncio.create_task(self._handle_todoist_stop(todoist_id))
+        else:
+            logger.warning("No currently selected todoist ID found to add comment to.")
+
+    def _handle_completed(self) -> None:
+        logger.info("Resuming all messages to MQTT, adding comment and completing Todoist task.")
+        self.led_controller.paused_event.set()
+        todoist_id = self._get_current_todoist_id()
+        if todoist_id:
+            asyncio.create_task(self._handle_todoist_completed(todoist_id))
+        else:
+            logger.warning("No currently selected todoist ID found to complete.")
+
     def _on_mqtt_message(self, client, userdata, msg):
         """General MQTT message handler for subscribed commands"""
         topic = msg.topic
@@ -1218,31 +1240,27 @@ class NotificationCollator:
         logger.debug(f"Received MQTT message on {topic}: {payload!r}")
 
         if topic == "nextTODO/select":
-            self.calendar_manager.handle_todo_select(payload)
+            cmd = payload.strip().lower()
+            if cmd == "start":
+                self._handle_start()
+            elif cmd == "stop":
+                self._handle_stop()
+            elif cmd == "completed":
+                self._handle_completed()
+            else:
+                self.calendar_manager.handle_todo_select(payload)
         elif topic == "nextTODO/select/start":
-            logger.info("Received nextTODO/select/start. Pausing text messages/interrupts to the sign.")
-            self.led_controller.paused_event.clear()
+            self._handle_start()
         elif topic == "nextTODO/select/stop":
-            logger.info("Received nextTODO/select/stop. Resuming all messages to MQTT, adding comment to Todoist.")
-            self.led_controller.paused_event.set()
-            todoist_id = self._get_current_todoist_id()
-            if todoist_id:
-                asyncio.create_task(self._handle_todoist_stop(todoist_id))
-            else:
-                logger.warning("No currently selected todoist ID found to add comment to.")
+            self._handle_stop()
         elif topic == "nextTODO/select/completed":
-            logger.info("Received nextTODO/select/completed. Resuming all messages to MQTT, adding comment and completing Todoist task.")
-            self.led_controller.paused_event.set()
-            todoist_id = self._get_current_todoist_id()
-            if todoist_id:
-                asyncio.create_task(self._handle_todoist_completed(todoist_id))
-            else:
-                logger.warning("No currently selected todoist ID found to complete.")
+            self._handle_completed()
         elif topic == "nextTODO/personal/elapsed":
             self.latest_elapsed_time = payload
             logger.debug(f"Updated latest elapsed time: {payload!r}")
         else:
             logger.debug(f"No handler for topic {topic!r}")
+
 
 
 
