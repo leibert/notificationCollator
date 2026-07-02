@@ -58,6 +58,8 @@ class Config:
     CAL_SCRAPER_HOST = os.environ.get('CAL_SCRAPER_HOST')
     TIMEZONE = os.environ.get('TIMEZONE', 'UTC')
     LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+    TODOIST_API_TOKEN = os.environ.get('TODOIST_API_TOKEN')
+
 
     # Signal Configuration
     # Set to your Signal account phone number (e.g. +15551234567) to suppress
@@ -580,6 +582,9 @@ class LEDSignController:
         self.client = mqtt_client
         self.current_mode = "bigClock"
         self.connected_event = connected_event
+        self.paused_event = asyncio.Event()
+        self.paused_event.set()
+
 
     def _safe_publish(self, topic: str, payload: Any, qos: int = 0) -> bool:
         """Publish to MQTT with exception handling and QoS support.
@@ -723,12 +728,21 @@ class CalendarManager:
             logger.debug(f"Fetched {len(self.todo_list)} TODO items")
 
             if self.todo_list:
-                todo = self.todo_list[self.todo_index].split(',')[0]
+                todo = self.todo_list[self.todo_index].split(',')
                 try:
-                    self.client.publish("nextTODO/personal", todo)
+                    todoist_id = todo[0].strip() if len(todo) > 0 else ""
+                    title = todo[1].strip() if len(todo) > 1 else ""
+                    description = todo[2].strip() if len(todo) > 2 else ""
+
+                    self.client.publish("nextTODO/personal/todoistID", todoist_id)
+                    self.client.publish("nextTODO/personal", title)
+                    self.client.publish("nextTODO/personal/title", title)
+                    self.client.publish("nextTODO/personal/description", description)
+                    
                 except Exception as e:
                     logger.error(f"Failed to publish TODO to MQTT: {e}")
                 logger.debug(f"Published TODO: {todo!r}")
+
             else:
                 logger.debug("No TODOs available after fetch")
 
@@ -782,9 +796,23 @@ class CalendarManager:
             logger.warning(f"Unsupported todo select command: {command!r}")
             return
 
-        todo = self.todo_list[self.todo_index].split(',')[0]
-        self.client.publish("nextTODO/personal", todo)
+        todo = self.todo_list[self.todo_index].split(',')
+        todoist_id = todo[0].strip() if len(todo) > 0 else ""
+        title = todo[1].strip() if len(todo) > 1 else ""
+        description = todo[2].strip() if len(todo) > 2 else ""
+
+        self.client.publish("nextTODO/personal/todoistID", todoist_id)
+        self.client.publish("nextTODO/personal", title)
+        self.client.publish("nextTODO/personal/title", title)
+        self.client.publish("nextTODO/personal/description", description)
+        if self.led_controller.paused_event.is_set():
+            self.client.publish("ledSign/mode", "showTodo")
+        else:
+            logger.info("Sign is paused — skipping publishing ledSign/mode showTodo")
+        
         logger.info(f"Rotated todo ({cmd}): {todo!r}")
+
+
 
     async def update_schedule(self) -> None:
         """Fetch and process calendar schedule."""
@@ -982,7 +1010,12 @@ class MessageProcessor:
         active_queue = False
 
         while True:
+            await self.led_controller.paused_event.wait()
             timestamp, msg_type, sender, text = await self.message_queue.get()
+            if not self.led_controller.paused_event.is_set():
+                logger.info("Message processor paused while message was in queue; waiting to display...")
+                await self.led_controller.paused_event.wait()
+
 
             if not active_queue:
                 active_queue = True
@@ -1028,6 +1061,8 @@ class NotificationCollator:
         )
         self.message_processor = MessageProcessor(self.message_queue, self.led_controller)
         self._task_restart_counts: Dict[str, int] = {}
+        self.latest_elapsed_time: str = "0"
+
 
     # -------------------------------------------------------------------------
     # MQTT setup
@@ -1072,10 +1107,18 @@ class NotificationCollator:
             self._set_mqtt_connected(True)
             # Re-subscribe on every connect — covers both initial connect and reconnects
             try:
-                client.subscribe("nextTODO/select")
-                logger.info("Subscribed to nextTODO/select")
+                topics = [
+                    ("nextTODO/select", 0),
+                    ("nextTODO/select/start", 0),
+                    ("nextTODO/select/stop", 0),
+                    ("nextTODO/select/completed", 0),
+                    ("nextTODO/personal/elapsed", 0),
+                ]
+                client.subscribe(topics)
+                logger.info("Subscribed to nextTODO/select and related topics")
             except Exception as e:
                 logger.error(f"Failed to subscribe on connect: {e}")
+
         else:
             logger.error(f"Connected to MQTT broker with error code {rc}")
             self._set_mqtt_connected(False)
@@ -1094,6 +1137,80 @@ class NotificationCollator:
         self._set_mqtt_connected(False)
         logger.error("Failed to connect to MQTT broker, will retry...")
 
+    def _get_current_todoist_id(self) -> Optional[str]:
+        mgr = self.calendar_manager
+        if not mgr.todo_list or mgr.todo_index >= len(mgr.todo_list):
+            return None
+        todo_line = mgr.todo_list[mgr.todo_index]
+        todo_parts = todo_line.split(',')
+        if todo_parts:
+            return todo_parts[0].strip()
+        return None
+
+    async def _add_todoist_comment(self, task_id: str, content: str) -> bool:
+        if not Config.TODOIST_API_TOKEN:
+            logger.error("TODOIST_API_TOKEN is not set in environment")
+            return False
+            
+        headers = {
+            "Authorization": f"Bearer {Config.TODOIST_API_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "task_id": task_id,
+            "content": content
+        }
+        
+        def do_post():
+            response = requests.post("https://api.todoist.com/rest/v2/comments", headers=headers, json=data, timeout=10)
+            response.raise_for_status()
+            return response.json()
+            
+        try:
+            await asyncio.to_thread(do_post)
+            logger.info(f"Successfully added comment to Todoist task {task_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error adding comment to Todoist task {task_id}: {e}")
+            return False
+
+    async def _complete_todoist_task(self, task_id: str) -> bool:
+        if not Config.TODOIST_API_TOKEN:
+            logger.error("TODOIST_API_TOKEN is not set in environment")
+            return False
+            
+        headers = {
+            "Authorization": f"Bearer {Config.TODOIST_API_TOKEN}"
+        }
+        
+        def do_post():
+            response = requests.post(f"https://api.todoist.com/rest/v2/tasks/{task_id}/close", headers=headers, timeout=10)
+            response.raise_for_status()
+            return response.status_code
+            
+        try:
+            await asyncio.to_thread(do_post)
+            logger.info(f"Successfully completed Todoist task {task_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error completing Todoist task {task_id}: {e}")
+            return False
+
+    async def _handle_todoist_stop(self, todoist_id: str) -> None:
+        elapsed = getattr(self, "latest_elapsed_time", "0")
+        current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        comment_content = f"Time spent: {elapsed} (recorded on {current_time_str})"
+        
+        await self._add_todoist_comment(todoist_id, comment_content)
+
+    async def _handle_todoist_completed(self, todoist_id: str) -> None:
+        elapsed = getattr(self, "latest_elapsed_time", "0")
+        current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        comment_content = f"Time spent: {elapsed} (recorded on {current_time_str})"
+        
+        await self._add_todoist_comment(todoist_id, comment_content)
+        await self._complete_todoist_task(todoist_id)
+
     def _on_mqtt_message(self, client, userdata, msg):
         """General MQTT message handler for subscribed commands"""
         topic = msg.topic
@@ -1102,8 +1219,32 @@ class NotificationCollator:
 
         if topic == "nextTODO/select":
             self.calendar_manager.handle_todo_select(payload)
+        elif topic == "nextTODO/select/start":
+            logger.info("Received nextTODO/select/start. Pausing text messages/interrupts to the sign.")
+            self.led_controller.paused_event.clear()
+        elif topic == "nextTODO/select/stop":
+            logger.info("Received nextTODO/select/stop. Resuming all messages to MQTT, adding comment to Todoist.")
+            self.led_controller.paused_event.set()
+            todoist_id = self._get_current_todoist_id()
+            if todoist_id:
+                asyncio.create_task(self._handle_todoist_stop(todoist_id))
+            else:
+                logger.warning("No currently selected todoist ID found to add comment to.")
+        elif topic == "nextTODO/select/completed":
+            logger.info("Received nextTODO/select/completed. Resuming all messages to MQTT, adding comment and completing Todoist task.")
+            self.led_controller.paused_event.set()
+            todoist_id = self._get_current_todoist_id()
+            if todoist_id:
+                asyncio.create_task(self._handle_todoist_completed(todoist_id))
+            else:
+                logger.warning("No currently selected todoist ID found to complete.")
+        elif topic == "nextTODO/personal/elapsed":
+            self.latest_elapsed_time = payload
+            logger.debug(f"Updated latest elapsed time: {payload!r}")
         else:
             logger.debug(f"No handler for topic {topic!r}")
+
+
 
     # -------------------------------------------------------------------------
     # Task supervision
