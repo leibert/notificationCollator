@@ -1162,7 +1162,7 @@ class NotificationCollator:
         }
         
         def do_post():
-            response = requests.post("https://api.todoist.com/rest/v2/comments", headers=headers, json=data, timeout=10)
+            response = requests.post("https://api.todoist.com/api/v1/comments", headers=headers, json=data, timeout=10)
             response.raise_for_status()
             return response.json()
             
@@ -1184,7 +1184,7 @@ class NotificationCollator:
         }
         
         def do_post():
-            response = requests.post(f"https://api.todoist.com/rest/v2/tasks/{task_id}/close", headers=headers, timeout=10)
+            response = requests.post(f"https://api.todoist.com/api/v1/tasks/{task_id}/close", headers=headers, timeout=10)
             response.raise_for_status()
             return response.status_code
             
@@ -1195,6 +1195,7 @@ class NotificationCollator:
         except Exception as e:
             logger.error(f"Error completing Todoist task {task_id}: {e}")
             return False
+
 
     async def _handle_todoist_stop(self, todoist_id: str) -> None:
         elapsed = getattr(self, "latest_elapsed_time", "0")
