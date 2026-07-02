@@ -1220,7 +1220,10 @@ class NotificationCollator:
         self.led_controller.paused_event.set()
         todoist_id = self._get_current_todoist_id()
         if todoist_id:
-            asyncio.create_task(self._handle_todoist_stop(todoist_id))
+            if self.loop and self.loop.is_running():
+                asyncio.run_coroutine_threadsafe(self._handle_todoist_stop(todoist_id), self.loop)
+            else:
+                logger.error("Cannot handle Todoist stop: asyncio event loop is not running")
         else:
             logger.warning("No currently selected todoist ID found to add comment to.")
 
@@ -1229,9 +1232,13 @@ class NotificationCollator:
         self.led_controller.paused_event.set()
         todoist_id = self._get_current_todoist_id()
         if todoist_id:
-            asyncio.create_task(self._handle_todoist_completed(todoist_id))
+            if self.loop and self.loop.is_running():
+                asyncio.run_coroutine_threadsafe(self._handle_todoist_completed(todoist_id), self.loop)
+            else:
+                logger.error("Cannot handle Todoist completed: asyncio event loop is not running")
         else:
             logger.warning("No currently selected todoist ID found to complete.")
+
 
     def _on_mqtt_message(self, client, userdata, msg):
         """General MQTT message handler for subscribed commands"""
