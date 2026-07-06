@@ -1322,15 +1322,15 @@ class NotificationCollator:
             remote_cmd
         ]
 
-        # Mask the password in the command logging for security
         logged_cmd = list(cmd)
         if len(logged_cmd) > 2 and logged_cmd[0] == "sshpass" and logged_cmd[1] == "-p":
             logged_cmd[2] = "***"
-        logger.info(f"Local command to execute: {' '.join(logged_cmd)}")
-        logger.debug(f"Raw print content (hex): {print_content.encode('utf-8').hex()}")
+        logger.warning(f"DEVTERM LOCAL CMD: {' '.join(logged_cmd)}")
+        logger.warning(f"DEVTERM REMOTE CMD: {remote_cmd}")
+        logger.warning(f"DEVTERM PRINT CONTENT:\n{print_content}")
 
         try:
-            logger.info(f"Sending DevTerm print command to {user}@{host}...")
+            logger.warning(f"Sending DevTerm print command to {user}@{host}...")
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -1340,12 +1340,12 @@ class NotificationCollator:
             stdout_str = stdout.decode('utf-8', errors='replace').strip()
             stderr_str = stderr.decode('utf-8', errors='replace').strip()
             
-            logger.info(f"Subprocess return code: {process.returncode}")
-            logger.info(f"Subprocess stdout: {stdout_str!r}")
-            logger.info(f"Subprocess stderr: {stderr_str!r}")
+            logger.warning(f"Subprocess return code: {process.returncode}")
+            logger.warning(f"Subprocess stdout: {stdout_str!r}")
+            logger.warning(f"Subprocess stderr: {stderr_str!r}")
 
             if process.returncode == 0:
-                logger.info("Successfully sent print command to DevTerm")
+                logger.warning("Successfully sent print command to DevTerm")
             else:
                 logger.error(f"Failed to send print command to DevTerm (code {process.returncode})")
         except Exception as e:
@@ -1360,7 +1360,10 @@ class NotificationCollator:
         
         # Debounce check to prevent duplicate print jobs
         now = time.time()
-        title = self.calendar_manager.active_todo_title or ""
+        title = self.calendar_manager.active_todo_title
+        if not title:
+            _, title, _ = self._get_current_todo_info()
+        title = title or ""
         
         # If it's the exact same task title, debounce for 30 seconds to prevent duplicates.
         # Otherwise, if it's a different task, enforce a short 2-second debounce.
@@ -1376,12 +1379,11 @@ class NotificationCollator:
         self.last_print_time = now
         self.last_printed_title = title
 
-
-
         if self.loop and self.loop.is_running():
             asyncio.run_coroutine_threadsafe(self._send_devterm_print_command(), self.loop)
         else:
             logger.error("Cannot send DevTerm command: asyncio event loop is not running")
+
 
 
 
