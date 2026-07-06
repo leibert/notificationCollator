@@ -14,7 +14,9 @@ Requirements:
 
 import os
 import sys
+import time
 import pickle
+
 import asyncio
 import logging
 import traceback
@@ -1102,6 +1104,8 @@ class NotificationCollator:
         self.message_processor = MessageProcessor(self.message_queue, self.led_controller)
         self._task_restart_counts: Dict[str, int] = {}
         self.latest_elapsed_time: str = "0"
+        self.last_print_time: float = 0.0
+
 
 
     # -------------------------------------------------------------------------
@@ -1279,32 +1283,33 @@ class NotificationCollator:
 
 
         # Formatting for a 2.25" (58mm) wide thermal paper strip using Unicode mode (TTF font)
-        # Size 4 is the largest (approx 16-20 chars per line).
-        # Size 2 is standard/readable (approx 32 chars per line).
-        wrapped_title = textwrap.fill(title, width=18)
+        # Size 5 is huge (approx 10-12 chars per line).
+        # Size 3 is large (approx 16 chars per line).
+        wrapped_title = textwrap.fill(title, width=12)
         
         if notes and notes.lower() != 'none':
-            wrapped_notes = textwrap.fill(notes, width=32)
+            wrapped_notes = textwrap.fill(notes, width=16)
         else:
             wrapped_notes = "No notes"
             
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # ESC/POS commands for Unicode TTF font mode
-        ESC_BIG = "\x1b\x21\x01\x1d\x21\x04"    # Unicode font, Size 4 (Largest)
-        ESC_NORMAL = "\x1b\x21\x01\x1d\x21\x02" # Unicode font, Size 2 (Standard)
+        ESC_BIG = "\x1b\x21\x01\x1d\x21\x05"    # Unicode font, Size 5 (Huge)
+        ESC_NORMAL = "\x1b\x21\x01\x1d\x21\x03" # Unicode font, Size 3 (Large)
 
         # Construct the print content
         print_content = (
-            f"{ESC_NORMAL}================================\n"
+            f"{ESC_NORMAL}================\n"
             f"{ESC_BIG}{wrapped_title}\n{ESC_NORMAL}"
-            "--------------------------------\n"
+            "----------------\n"
             f"{wrapped_notes}\n"
-            "--------------------------------\n"
+            "----------------\n"
             f"Printed: {time_str}\n"
-            "================================\n"
+            "================\n"
             "\n" * 6  # Feed spaces so we can tear it off cleanly
         )
+
 
 
 
@@ -1356,10 +1361,20 @@ class NotificationCollator:
     def _handle_start(self) -> None:
         logger.info("Pausing text messages/interrupts to the sign.")
         self.led_controller.paused_event.clear()
+        
+        # Debounce check to prevent duplicate print jobs (within 2 seconds)
+        now = time.time()
+        if now - self.last_print_time < 2.0:
+            logger.warning("Start command received too quickly — ignoring duplicate print job (debounced)")
+            return
+        self.last_print_time = now
+
+
         if self.loop and self.loop.is_running():
             asyncio.run_coroutine_threadsafe(self._send_devterm_print_command(), self.loop)
         else:
             logger.error("Cannot send DevTerm command: asyncio event loop is not running")
+
 
 
     def _handle_stop(self) -> None:
