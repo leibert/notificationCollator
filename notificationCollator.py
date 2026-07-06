@@ -16,7 +16,9 @@ import os
 import sys
 import time
 import tempfile
+import json
 import pickle
+
 
 
 import asyncio
@@ -1298,47 +1300,214 @@ class NotificationCollator:
             
         if not title:
             logger.warning("No active todo or currently selected todo to print")
-            return
+              # Python script content to run on the DevTerm to render text to a PNG and print it
+        render_script = """import sys
+import time
+import json
+import subprocess
+from PIL import Image, ImageDraw, ImageFont
 
+def wrap_text_to_width(text, font, max_width, draw):
+    raw_lines = text.splitlines()
+    wrapped_lines = []
+    
+    for raw_line in raw_lines:
+        words = raw_line.split(' ')
+        current_line = []
+        
+        for word in words:
+            if not word:
+                continue
+            w_word, _ = font.getsize(word)
+            if w_word > max_width:
+                # Flush current line first
+                if current_line:
+                    wrapped_lines.append(' '.join(current_line))
+                    current_line = []
+                # Break down long word character by character
+                sub_word = ""
+                for char in word:
+                    test_sub = sub_word + char
+                    w_sub, _ = font.getsize(test_sub)
+                    if w_sub <= max_width:
+                        sub_word = test_sub
+                    else:
+                        wrapped_lines.append(sub_word)
+                        sub_word = char
+                if sub_word:
+                    current_line = [sub_word]
+            else:
+                test_line = ' '.join(current_line + [word]) if current_line else word
+                w_test, _ = font.getsize(test_line)
+                if w_test <= max_width:
+                    current_line.append(word)
+                else:
+                    if current_line:
+                        wrapped_lines.append(' '.join(current_line))
+                    current_line = [word]
+        if current_line:
+            wrapped_lines.append(' '.join(current_line))
+    return wrapped_lines
 
-            
-        time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        # ESC/POS commands for Unicode TTF font mode
-        ESC_BIG = "\x1b\x21\x01\x1d\x21\x04"    # Unicode font, Size 4 (Largest valid size)
-        ESC_NORMAL = "\x1b\x21\x01\x1d\x21\x03" # Unicode font, Size 3 (Notes size)
-        # Word-wrap the title and notes to prevent the printer from splitting words mid-character
-        wrapped_title = textwrap.fill(title, width=24)
-        wrapped_notes = ""
-        if notes and notes.lower() != 'none':
-            wrapped_notes = textwrap.fill(notes, width=36)
-
-        # Construct the print content
-        print_content = (
-            f"{ESC_NORMAL}====================================\n"
-            f"{ESC_BIG}{wrapped_title}\n{ESC_NORMAL}"
-            "------------------------------------\n"
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except Exception as e:
+        print(f"Failed to parse JSON from stdin: {e}")
+        sys.exit(1)
+        
+    title = data.get("title", "")
+    notes = data.get("notes", "")
+    time_str = data.get("time", "")
+    
+    # Paths to Roboto fonts
+    font_bold_path = "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Bold.ttf"
+    font_reg_path = "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Regular.ttf"
+    
+    try:
+        title_font = ImageFont.truetype(font_bold_path, 28)
+        notes_font = ImageFont.truetype(font_reg_path, 20)
+        meta_font = ImageFont.truetype(font_reg_path, 16)
+    except Exception as e:
+        print(f"Failed to load fonts: {e}")
+        sys.exit(1)
+        
+    # We create a dummy image to get a Draw context for text sizing
+    dummy_img = Image.new('1', (384, 100), 1)
+    dummy_draw = ImageDraw.Draw(dummy_img)
+    
+    # Wrap text to 384px max width (leaving 0px margins on left/right)
+    title_lines = wrap_text_to_width(title, title_font, 384, dummy_draw)
+    
+    wrapped_notes_lines = []
+    if notes and notes.lower() != 'none':
+        wrapped_notes_lines = wrap_text_to_width(notes, notes_font, 384, dummy_draw)
+        
+    # Calculate height dynamically
+    y = 20  # Top padding
+    
+    # Top border line
+    y += 10 # Spacing after line
+    
+    # Title height
+    title_line_height = title_font.getsize("Ag")[1] + 6
+    title_height = len(title_lines) * title_line_height
+    y += title_height + 25  # spacing after title section
+    
+    # Separator line
+    y += 15 # Spacing after line
+    
+    # Notes height
+    if wrapped_notes_lines:
+        notes_line_height = notes_font.getsize("Ag")[1] + 4
+        notes_height = len(wrapped_notes_lines) * notes_line_height
+        y += notes_height + 25  # spacing after notes section
+        # Separator line
+        y += 15 # Spacing after line
+        
+    # Printed time height
+    meta_line_height = meta_font.getsize("Ag")[1]
+    y += meta_line_height + 25  # Spacing before bottom border
+    
+    # Bottom border line
+    y += 20
+    
+    # No tear-off padding inside the PNG (prevents CUPS downscaling)
+    total_height = y
+    
+    # Create the actual image
+    img = Image.new('1', (384, total_height), 1)
+    draw = ImageDraw.Draw(img)
+    
+    # Draw elements
+    curr_y = 20
+    
+    # Draw Top Border: horizontal line (margins at 0px and 384px)
+    draw.line([(0, curr_y), (384, curr_y)], fill=0, width=3)
+    curr_y += 20
+    
+    # Draw Title
+    for line in title_lines:
+        draw.text((0, curr_y), line, font=title_font, fill=0)
+        curr_y += title_line_height
+    curr_y += 25
+    
+    # Draw Separator
+    draw.line([(0, curr_y), (384, curr_y)], fill=0, width=1)
+    curr_y += 20
+    
+    # Draw Notes
+    if wrapped_notes_lines:
+        for line in wrapped_notes_lines:
+            draw.text((0, curr_y), line, font=notes_font, fill=0)
+            curr_y += notes_line_height
+        curr_y += 25
+        
+        # Draw Separator
+        draw.line([(0, curr_y), (384, curr_y)], fill=0, width=1)
+        curr_y += 20
+        
+    # Draw Printed Time
+    draw.text((0, curr_y), f"Printed: {time_str}", font=meta_font, fill=0)
+    curr_y += meta_line_height + 25
+    
+    # Draw Bottom Border
+    draw.line([(0, curr_y), (384, curr_y)], fill=0, width=3)
+    
+    # Save printout image
+    out_path = "/tmp/devterm_printout.png"
+    img.save(out_path)
+    print(f"Saved image to {out_path}")
+    
+    # Run cups print command forcing portrait mode
+    try:
+        res = subprocess.run(
+            ["lp", "-d", "devterm_printer", "-o", "orientation-requested=3", out_path],
+            capture_output=True,
+            text=True
         )
-        if wrapped_notes:
-            print_content += (
-                f"{wrapped_notes}\n"
-                "------------------------------------\n"
-            )
-        print_content += (
-            f"Printed: {time_str}\n"
-            "====================================\n"
-            + "\n" * 8  # Feed spaces so we can tear it off cleanly
-        )
+        if res.returncode == 0:
+            print("Successfully sent print job to devterm_printer via lp")
+            print(res.stdout)
+        else:
+            print(f"lp failed with code {res.returncode}")
+            print(f"Stderr: {res.stderr}")
+            sys.exit(1)
+    except Exception as e:
+        print(f"Failed to execute lp command: {e}")
+        sys.exit(1)
 
+    # Wait for the CUPS print job to finish printing before feeding the paper
+    time.sleep(2.5)
 
+    # Feed paper past the cutter by writing raw newlines to the printer character pipe
+    try:
+        subprocess.run("echo '\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n' > /tmp/DEVTERM_PRINTER_IN", shell=True)
+        print("Fed paper past the cutter")
+    except Exception as e:
+        print(f"Failed to feed paper: {e}")
 
+if __name__ == '__main__':
+    main()
+"""
 
+        # Prepare print data payload
+        payload_data = {
+            "title": title,
+            "notes": notes,
+            "time": time_str
+        }
+        payload_str = json.dumps(payload_data)
 
-        # Base64 encode the print content to safely transmit it without escaping bugs
-        encoded_content = base64.b64encode(print_content.encode('utf-8')).decode('utf-8')
+        # Base64 encode the render script and the payload to transmit safely
+        encoded_script = base64.b64encode(render_script.encode('utf-8')).decode('utf-8')
+        encoded_payload = base64.b64encode(payload_str.encode('utf-8')).decode('utf-8')
 
         # Shell command to execute on the remote machine
-        remote_cmd = f"echo '{encoded_content}' | base64 -d > /tmp/DEVTERM_PRINTER_IN"
+        remote_cmd = (
+            f"echo '{encoded_script}' | base64 -d > /tmp/render_print.py && "
+            f"echo '{encoded_payload}' | base64 -d | python3 /tmp/render_print.py"
+        )
 
         cmd = [
             "sshpass", "-p", password,
@@ -1351,7 +1520,8 @@ class NotificationCollator:
             logged_cmd[2] = "***"
         logger.warning(f"DEVTERM LOCAL CMD: {' '.join(logged_cmd)}")
         logger.warning(f"DEVTERM REMOTE CMD: {remote_cmd}")
-        logger.warning(f"DEVTERM PRINT CONTENT:\n{print_content}")
+        logger.warning(f"DEVTERM PRINT PAYLOAD: {payload_data}")
+
 
         try:
             logger.warning(f"Sending DevTerm print command to {user}@{host}...")
