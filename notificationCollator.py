@@ -1307,25 +1307,28 @@ class NotificationCollator:
         # ESC/POS commands for Unicode TTF font mode
         ESC_BIG = "\x1b\x21\x01\x1d\x21\x04"    # Unicode font, Size 4 (Largest valid size)
         ESC_NORMAL = "\x1b\x21\x01\x1d\x21\x03" # Unicode font, Size 3 (Notes size)
-
-        # Construct the print content (allowing printer hardware/driver to handle wrapping)
-        print_content = (
-            f"{ESC_NORMAL}========================================\n"
-            f"{ESC_BIG}{title}\n{ESC_NORMAL}"
-            "----------------------------------------------------------------\n"
-        )
+        # Word-wrap the title and notes to prevent the printer from splitting words mid-character
+        wrapped_title = textwrap.fill(title, width=24)
+        wrapped_notes = ""
         if notes and notes.lower() != 'none':
+            wrapped_notes = textwrap.fill(notes, width=36)
+
+        # Construct the print content
+        print_content = (
+            f"{ESC_NORMAL}====================================\n"
+            f"{ESC_BIG}{wrapped_title}\n{ESC_NORMAL}"
+            "------------------------------------\n"
+        )
+        if wrapped_notes:
             print_content += (
-                f"{notes}\n"
-                "--------------------------------\n"
+                f"{wrapped_notes}\n"
+                "------------------------------------\n"
             )
         print_content += (
             f"Printed: {time_str}\n"
             "====================================\n"
             + "\n" * 8  # Feed spaces so we can tear it off cleanly
         )
-
-
 
 
 
