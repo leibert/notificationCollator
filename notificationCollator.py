@@ -1310,19 +1310,19 @@ class NotificationCollator:
 
         # Construct the print content (allowing printer hardware/driver to handle wrapping)
         print_content = (
-            f"{ESC_NORMAL}====================================\n"
+            f"{ESC_NORMAL}========================================\n"
             f"{ESC_BIG}{title}\n{ESC_NORMAL}"
             "----------------------------------------------------------------\n"
         )
-        if notes or notes.lower() != 'none':
+        if notes and notes.lower() != 'none':
             print_content += (
                 f"{notes}\n"
-                ""----------------------------------------------------------------\n"
+                "--------------------------------\n"
             )
         print_content += (
             f"Printed: {time_str}\n"
-            ====================================\n"
-            + "\n" * 8  #             Feed spaces so we can tear it off cleanly
+            "====================================\n"
+            + "\n" * 8  # Feed spaces so we can tear it off cleanly
         )
 
 
