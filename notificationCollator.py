@@ -1310,7 +1310,6 @@ from PIL import Image, ImageDraw, ImageFont
 def wrap_text_to_width(text, font, max_width, draw):
     raw_lines = text.splitlines()
     wrapped_lines = []
-    
     for raw_line in raw_lines:
         words = raw_line.split(' ')
         current_line = []
@@ -1574,7 +1573,13 @@ if __name__ == '__main__':
         self.last_printed_title = title
 
         if self.loop and self.loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._send_devterm_print_command(), self.loop)
+            fut = asyncio.run_coroutine_threadsafe(self._send_devterm_print_command(), self.loop)
+            def done_callback(f):
+                try:
+                    f.result()
+                except Exception as ex:
+                    logger.error(f"Error in print command coroutine: {ex}\n{traceback.format_exc()}")
+            fut.add_done_callback(done_callback)
         else:
             logger.error("Cannot send DevTerm command: asyncio event loop is not running")
 
