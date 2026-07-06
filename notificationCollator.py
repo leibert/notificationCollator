@@ -1319,8 +1319,9 @@ class NotificationCollator:
             "--------------------------------\n"
             f"Printed: {time_str}\n"
             "================================\n"
-            "\n" * 6  # Feed spaces so we can tear it off cleanly
+            + "\n" * 6  # Feed spaces so we can tear it off cleanly
         )
+
 
 
 
