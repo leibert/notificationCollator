@@ -1279,6 +1279,13 @@ class NotificationCollator:
             remote_cmd
         ]
 
+        # Mask the password in the command logging for security
+        logged_cmd = list(cmd)
+        if len(logged_cmd) > 2 and logged_cmd[0] == "sshpass" and logged_cmd[1] == "-p":
+            logged_cmd[2] = "***"
+        logger.info(f"Local command to execute: {' '.join(logged_cmd)}")
+        logger.debug(f"Raw print content (hex): {print_content.encode('utf-8').hex()}")
+
         try:
             logger.info(f"Sending DevTerm print command to {user}@{host}...")
             process = await asyncio.create_subprocess_exec(
@@ -1287,12 +1294,21 @@ class NotificationCollator:
                 stderr=asyncio.subprocess.PIPE
             )
             stdout, stderr = await process.communicate()
+            stdout_str = stdout.decode('utf-8', errors='replace').strip()
+            stderr_str = stderr.decode('utf-8', errors='replace').strip()
+            
+            logger.info(f"Subprocess return code: {process.returncode}")
+            logger.info(f"Subprocess stdout: {stdout_str!r}")
+            logger.info(f"Subprocess stderr: {stderr_str!r}")
+
             if process.returncode == 0:
                 logger.info("Successfully sent print command to DevTerm")
             else:
-                logger.error(f"Failed to send print command to DevTerm (code {process.returncode}): {stderr.decode().strip()}")
+                logger.error(f"Failed to send print command to DevTerm (code {process.returncode})")
         except Exception as e:
             logger.error(f"Exception while sending SSH command: {e}")
+            logger.debug(f"Full traceback: {traceback.format_exc()}")
+
 
 
     def _handle_start(self) -> None:
