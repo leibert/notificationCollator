@@ -1301,8 +1301,6 @@ class NotificationCollator:
             return
 
 
-        if not notes or notes.lower() == 'none':
-            notes = "No notes"
             
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1312,14 +1310,19 @@ class NotificationCollator:
 
         # Construct the print content (allowing printer hardware/driver to handle wrapping)
         print_content = (
-            f"{ESC_NORMAL}================================\n"
+            f"{ESC_NORMAL}====================================\n"
             f"{ESC_BIG}{title}\n{ESC_NORMAL}"
-            "--------------------------------\n"
-            f"{notes}\n"
-            "--------------------------------\n"
+            "----------------------------------------------------------------\n"
+        )
+        if notes or notes.lower() != 'none':
+            print_content += (
+                f"{notes}\n"
+                ""----------------------------------------------------------------\n"
+            )
+        print_content += (
             f"Printed: {time_str}\n"
-            "================================\n"
-            + "\n" * 6  # Feed spaces so we can tear it off cleanly
+            ====================================\n"
+            + "\n" * 8  #             Feed spaces so we can tear it off cleanly
         )
 
 
