@@ -1105,6 +1105,8 @@ class NotificationCollator:
         self._task_restart_counts: Dict[str, int] = {}
         self.latest_elapsed_time: str = "0"
         self.last_print_time: float = 0.0
+        self.last_printed_title: str = ""
+
 
 
 
@@ -1282,33 +1284,27 @@ class NotificationCollator:
             return
 
 
-        # Formatting for a 2.25" (58mm) wide thermal paper strip using Unicode mode (TTF font)
-        # Size 5 is huge (approx 10-12 chars per line).
-        # Size 3 is large (approx 16 chars per line).
-        wrapped_title = textwrap.fill(title, width=12)
-        
-        if notes and notes.lower() != 'none':
-            wrapped_notes = textwrap.fill(notes, width=16)
-        else:
-            wrapped_notes = "No notes"
+        if not notes or notes.lower() == 'none':
+            notes = "No notes"
             
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # ESC/POS commands for Unicode TTF font mode
-        ESC_BIG = "\x1b\x21\x01\x1d\x21\x05"    # Unicode font, Size 5 (Huge)
-        ESC_NORMAL = "\x1b\x21\x01\x1d\x21\x03" # Unicode font, Size 3 (Large)
+        ESC_BIG = "\x1b\x21\x01\x1d\x21\x04"    # Unicode font, Size 4 (Largest valid size)
+        ESC_NORMAL = "\x1b\x21\x01\x1d\x21\x03" # Unicode font, Size 3 (Notes size)
 
-        # Construct the print content
+        # Construct the print content (allowing printer hardware/driver to handle wrapping)
         print_content = (
-            f"{ESC_NORMAL}================\n"
-            f"{ESC_BIG}{wrapped_title}\n{ESC_NORMAL}"
-            "----------------\n"
-            f"{wrapped_notes}\n"
-            "----------------\n"
+            f"{ESC_NORMAL}================================\n"
+            f"{ESC_BIG}{title}\n{ESC_NORMAL}"
+            "--------------------------------\n"
+            f"{notes}\n"
+            "--------------------------------\n"
             f"Printed: {time_str}\n"
-            "================\n"
+            "================================\n"
             "\n" * 6  # Feed spaces so we can tear it off cleanly
         )
+
 
 
 
@@ -1362,12 +1358,24 @@ class NotificationCollator:
         logger.info("Pausing text messages/interrupts to the sign.")
         self.led_controller.paused_event.clear()
         
-        # Debounce check to prevent duplicate print jobs (within 2 seconds)
+        # Debounce check to prevent duplicate print jobs
         now = time.time()
-        if now - self.last_print_time < 2.0:
-            logger.warning("Start command received too quickly — ignoring duplicate print job (debounced)")
+        title = self.calendar_manager.active_todo_title or ""
+        
+        # If it's the exact same task title, debounce for 30 seconds to prevent duplicates.
+        # Otherwise, if it's a different task, enforce a short 2-second debounce.
+        if title and title == self.last_printed_title:
+            debounce_limit = 30.0
+        else:
+            debounce_limit = 2.0
+            
+        if now - self.last_print_time < debounce_limit:
+            logger.warning(f"Start command received too quickly (same task debounce: {title == self.last_printed_title}) — ignoring duplicate print job (debounced)")
             return
+            
         self.last_print_time = now
+        self.last_printed_title = title
+
 
 
         if self.loop and self.loop.is_running():
