@@ -15,7 +15,9 @@ Requirements:
 import os
 import sys
 import time
+import tempfile
 import pickle
+
 
 import asyncio
 import logging
@@ -1265,9 +1267,24 @@ class NotificationCollator:
         await self._complete_todoist_task(todoist_id)
 
     async def _send_devterm_print_command(self) -> None:
+        # System-wide print lock to prevent duplicate print jobs across all processes
+        lock_file = os.path.join(tempfile.gettempdir(), "devterm_print.lock")
+        try:
+            if os.path.exists(lock_file):
+                mtime = os.path.getmtime(lock_file)
+                if time.time() - mtime < 10.0:
+                    logger.warning("DEVTERM PRINT LOCK: Lock file is active (less than 10s old). Ignoring print job.")
+                    return
+            # Acquire lock
+            with open(lock_file, "w") as f:
+                f.write(str(time.time()))
+        except Exception as e:
+            logger.warning(f"DEVTERM PRINT LOCK: Failed to check/write print lock file: {e}")
+
         host = Config.PRINT_HOST
         user = Config.PRINT_USER
         password = Config.PRINT_PASSWORD
+
 
         if not host or not user or not password:
             logger.warning("DevTerm SSH credentials not fully configured in environment")
