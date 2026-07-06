@@ -1297,10 +1297,13 @@ class NotificationCollator:
         
         if not title:
             _, title, notes = self._get_current_todo_info()
-            
+
         if not title:
             logger.warning("No active todo or currently selected todo to print")
-              # Python script content to run on the DevTerm to render text to a PNG and print it
+            return
+
+        time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Python script content to run on the DevTerm to render text to a PNG and print it
         render_script = """import sys
 import time
 import json
