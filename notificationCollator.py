@@ -1226,9 +1226,9 @@ class NotificationCollator:
         await self._complete_todoist_task(todoist_id)
 
     async def _send_devterm_print_command(self) -> None:
-        host = Config.DEVTERM_HOST
-        user = Config.DEVTERM_USER
-        password = Config.DEVTERM_PASSWORD
+        host = Config.PRINT_HOST
+        user = Config.PRINT_USER
+        password = Config.PRINT_PASSWORD
 
         if not host or not user or not password:
             logger.warning("DevTerm SSH credentials not fully configured in environment")
