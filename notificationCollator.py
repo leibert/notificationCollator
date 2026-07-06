@@ -18,7 +18,10 @@ import pickle
 import asyncio
 import logging
 import traceback
+import base64
+import textwrap
 from datetime import datetime
+
 from typing import Callable, Dict, List, Tuple, Optional, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -59,6 +62,10 @@ class Config:
     TIMEZONE = os.environ.get('TIMEZONE', 'UTC')
     LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
     TODOIST_API_TOKEN = os.environ.get('TODOIST_API_TOKEN')
+    PRINT_HOST = os.environ.get('PRINT_HOST')
+    PRINT_USER = os.environ.get('PRINT_USER')
+    PRINT_PASSWORD = os.environ.get('PRINT_PASSWORD')
+
 
 
     # Signal Configuration
@@ -1137,15 +1144,21 @@ class NotificationCollator:
         self._set_mqtt_connected(False)
         logger.error("Failed to connect to MQTT broker, will retry...")
 
-    def _get_current_todoist_id(self) -> Optional[str]:
+    def _get_current_todo_info(self) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         mgr = self.calendar_manager
         if not mgr.todo_list or mgr.todo_index >= len(mgr.todo_list):
-            return None
+            return None, None, None
         todo_line = mgr.todo_list[mgr.todo_index]
         todo_parts = todo_line.split(',')
-        if todo_parts:
-            return todo_parts[0].strip()
-        return None
+        
+        todoist_id = todo_parts[0].strip() if len(todo_parts) > 0 else None
+        title = todo_parts[1].strip() if len(todo_parts) > 1 else None
+        notes = todo_parts[3].strip() if len(todo_parts) > 3 else None
+        return todoist_id, title, notes
+
+    def _get_current_todoist_id(self) -> Optional[str]:
+        return self._get_current_todo_info()[0]
+
 
     async def _add_todoist_comment(self, task_id: str, content: str) -> bool:
         if not Config.TODOIST_API_TOKEN:
@@ -1212,9 +1225,84 @@ class NotificationCollator:
         await self._add_todoist_comment(todoist_id, comment_content)
         await self._complete_todoist_task(todoist_id)
 
+    async def _send_devterm_print_command(self) -> None:
+        host = Config.DEVTERM_HOST
+        user = Config.DEVTERM_USER
+        password = Config.DEVTERM_PASSWORD
+
+        if not host or not user or not password:
+            logger.warning("DevTerm SSH credentials not fully configured in environment")
+            return
+
+        todoist_id, title, notes = self._get_current_todo_info()
+        if not title:
+            logger.warning("No currently selected todo title to print")
+            return
+
+        # Formatting for a 2.25" (58mm) wide thermal paper strip
+        # When double-width mode is enabled, line width is halved to 16 characters.
+        wrapped_title = textwrap.fill(title, width=16)
+        
+        if notes and notes.lower() != 'none':
+            wrapped_notes = textwrap.fill(notes, width=32)
+        else:
+            wrapped_notes = "No notes"
+            
+        time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # ESC/POS commands
+        ESC_BIG = "\x1b\x21\x30"    # Double-height + double-width
+        ESC_NORMAL = "\x1b\x21\x00" # Standard font size
+
+        # Construct the print content with inline ESC/POS commands
+        print_content = (
+            "================================\n"
+            f"{ESC_BIG}{wrapped_title}\n{ESC_NORMAL}"
+            "--------------------------------\n"
+            f"{wrapped_notes}\n"
+            "--------------------------------\n"
+            f"Printed: {time_str}\n"
+            "================================\n"
+            "\n" * 6  # Feed spaces so we can tear it off cleanly
+        )
+
+
+        # Base64 encode the print content to safely transmit it without escaping bugs
+        encoded_content = base64.b64encode(print_content.encode('utf-8')).decode('utf-8')
+
+        # Shell command to execute on the remote machine
+        remote_cmd = f"echo '{encoded_content}' | base64 -d > /tmp/DEVTERM_PRINTER_IN"
+
+        cmd = [
+            "sshpass", "-p", password,
+            "ssh", "-o", "StrictHostKeyChecking=no", f"{user}@{host}",
+            remote_cmd
+        ]
+
+        try:
+            logger.info(f"Sending DevTerm print command to {user}@{host}...")
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            if process.returncode == 0:
+                logger.info("Successfully sent print command to DevTerm")
+            else:
+                logger.error(f"Failed to send print command to DevTerm (code {process.returncode}): {stderr.decode().strip()}")
+        except Exception as e:
+            logger.error(f"Exception while sending SSH command: {e}")
+
+
     def _handle_start(self) -> None:
         logger.info("Pausing text messages/interrupts to the sign.")
         self.led_controller.paused_event.clear()
+        if self.loop and self.loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._send_devterm_print_command(), self.loop)
+        else:
+            logger.error("Cannot send DevTerm command: asyncio event loop is not running")
+
 
     def _handle_stop(self) -> None:
         logger.info("Resuming all messages to MQTT, adding comment to Todoist.")
