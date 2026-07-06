@@ -1278,33 +1278,34 @@ class NotificationCollator:
             return
 
 
-        # Formatting for a 2.25" (58mm) wide thermal paper strip
-        # When 3x width mode is enabled, line width is reduced to 10 characters.
-        wrapped_title = textwrap.fill(title, width=10)
+        # Formatting for a 2.25" (58mm) wide thermal paper strip using Unicode mode (TTF font)
+        # Size 3 is large (approx 12-16 chars per line).
+        # Size 1 is standard/readable (approx 24-28 chars per line).
+        wrapped_title = textwrap.fill(title, width=12)
         
         if notes and notes.lower() != 'none':
-            wrapped_notes = textwrap.fill(notes, width=32)
+            wrapped_notes = textwrap.fill(notes, width=24)
         else:
             wrapped_notes = "No notes"
             
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # ESC/POS commands
-        ESC_BIG = "\x1d\x21\x22"    # 3x height + 3x width (GS ! 0x22)
-        ESC_NORMAL = "\x1d\x21\x00" # Standard font size (GS ! 0x00)
+        # ESC/POS commands for Unicode TTF font mode
+        ESC_BIG = "\x1b\x21\x01\x1d\x21\x03"    # Unicode font, Size 3
+        ESC_NORMAL = "\x1b\x21\x01\x1d\x21\x01" # Unicode font, Size 1
 
-
-        # Construct the print content with inline ESC/POS commands
+        # Construct the print content
         print_content = (
-            "================================\n"
+            f"{ESC_NORMAL}========================\n"
             f"{ESC_BIG}{wrapped_title}\n{ESC_NORMAL}"
-            "--------------------------------\n"
+            "------------------------\n"
             f"{wrapped_notes}\n"
-            "--------------------------------\n"
+            "------------------------\n"
             f"Printed: {time_str}\n"
-            "================================\n"
+            "========================\n"
             "\n" * 6  # Feed spaces so we can tear it off cleanly
         )
+
 
 
         # Base64 encode the print content to safely transmit it without escaping bugs
