@@ -664,6 +664,35 @@ class CalendarManager:
         self.todo_index: int = 0
         self.last_schedule_update: Optional[datetime] = None
         self.last_todo_update: Optional[datetime] = None
+        
+        # Track active todo details currently published to MQTT
+        self.active_todoist_id: Optional[str] = None
+        self.active_todo_title: Optional[str] = None
+        self.active_todo_notes: Optional[str] = None
+
+    def _parse_todo_line(self, todo_line: str) -> Tuple[str, str, str, str]:
+        """Parse a todo line into (todoist_id, title, timestamp, description)."""
+        try:
+            import csv
+            reader = csv.reader([todo_line], skipinitialspace=True)
+            parts = next(reader)
+            todoist_id = parts[0].strip() if len(parts) > 0 else ""
+            title = parts[1].strip() if len(parts) > 1 else ""
+            timestamp = parts[2].strip() if len(parts) > 2 else ""
+            # Description is the 4th element (index 3). If there are more elements (due to unquoted commas),
+            # join them back together.
+            description = ", ".join(parts[3:]).strip() if len(parts) > 3 else ""
+            return todoist_id, title, timestamp, description
+        except Exception as e:
+            logger.error(f"Error parsing todo line: {e}")
+            # Fallback to simple split
+            parts = todo_line.split(',')
+            todoist_id = parts[0].strip() if len(parts) > 0 else ""
+            title = parts[1].strip() if len(parts) > 1 else ""
+            timestamp = parts[2].strip() if len(parts) > 2 else ""
+            description = ", ".join(parts[3:]).strip() if len(parts) > 3 else ""
+            return todoist_id, title, timestamp, description
+
 
     def _safe_publish(self, topic: str, payload: Any, qos: int = 0) -> bool:
         """Publish with logging on failure and QoS support"""
@@ -735,11 +764,12 @@ class CalendarManager:
             logger.debug(f"Fetched {len(self.todo_list)} TODO items")
 
             if self.todo_list:
-                todo = self.todo_list[self.todo_index].split(',')
                 try:
-                    todoist_id = todo[0].strip() if len(todo) > 0 else ""
-                    title = todo[1].strip() if len(todo) > 1 else ""
-                    description = todo[2].strip() if len(todo) > 2 else ""
+                    todoist_id, title, timestamp, description = self._parse_todo_line(self.todo_list[self.todo_index])
+                    
+                    self.active_todoist_id = todoist_id
+                    self.active_todo_title = title
+                    self.active_todo_notes = description
 
                     self.client.publish("nextTODO/personal/todoistID", todoist_id)
                     self.client.publish("nextTODO/personal", title)
@@ -748,7 +778,8 @@ class CalendarManager:
                     
                 except Exception as e:
                     logger.error(f"Failed to publish TODO to MQTT: {e}")
-                logger.debug(f"Published TODO: {todo!r}")
+                logger.debug(f"Published TODO: {self.todo_list[self.todo_index]}")
+
 
             else:
                 logger.debug("No TODOs available after fetch")
@@ -803,10 +834,11 @@ class CalendarManager:
             logger.warning(f"Unsupported todo select command: {command!r}")
             return
 
-        todo = self.todo_list[self.todo_index].split(',')
-        todoist_id = todo[0].strip() if len(todo) > 0 else ""
-        title = todo[1].strip() if len(todo) > 1 else ""
-        description = todo[2].strip() if len(todo) > 2 else ""
+        todoist_id, title, timestamp, description = self._parse_todo_line(self.todo_list[self.todo_index])
+        
+        self.active_todoist_id = todoist_id
+        self.active_todo_title = title
+        self.active_todo_notes = description
 
         self.client.publish("nextTODO/personal/todoistID", todoist_id)
         self.client.publish("nextTODO/personal", title)
@@ -817,7 +849,8 @@ class CalendarManager:
         else:
             logger.info("Sign is paused — skipping publishing ledSign/mode showTodo")
         
-        logger.info(f"Rotated todo ({cmd}): {todo!r}")
+        logger.info(f"Rotated todo ({cmd}): {self.todo_list[self.todo_index]}")
+
 
 
 
@@ -1234,14 +1267,20 @@ class NotificationCollator:
             logger.warning("DevTerm SSH credentials not fully configured in environment")
             return
 
-        todoist_id, title, notes = self._get_current_todo_info()
+        title = self.calendar_manager.active_todo_title
+        notes = self.calendar_manager.active_todo_notes
+        
         if not title:
-            logger.warning("No currently selected todo title to print")
+            _, title, notes = self._get_current_todo_info()
+            
+        if not title:
+            logger.warning("No active todo or currently selected todo to print")
             return
 
+
         # Formatting for a 2.25" (58mm) wide thermal paper strip
-        # When double-width mode is enabled, line width is halved to 16 characters.
-        wrapped_title = textwrap.fill(title, width=16)
+        # When 3x width mode is enabled, line width is reduced to 10 characters.
+        wrapped_title = textwrap.fill(title, width=10)
         
         if notes and notes.lower() != 'none':
             wrapped_notes = textwrap.fill(notes, width=32)
@@ -1251,8 +1290,9 @@ class NotificationCollator:
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # ESC/POS commands
-        ESC_BIG = "\x1b\x21\x30"    # Double-height + double-width
-        ESC_NORMAL = "\x1b\x21\x00" # Standard font size
+        ESC_BIG = "\x1d\x21\x22"    # 3x height + 3x width (GS ! 0x22)
+        ESC_NORMAL = "\x1d\x21\x00" # Standard font size (GS ! 0x00)
+
 
         # Construct the print content with inline ESC/POS commands
         print_content = (
