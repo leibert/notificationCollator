@@ -1279,32 +1279,33 @@ class NotificationCollator:
 
 
         # Formatting for a 2.25" (58mm) wide thermal paper strip using Unicode mode (TTF font)
-        # Size 3 is large (approx 12-16 chars per line).
-        # Size 1 is standard/readable (approx 24-28 chars per line).
-        wrapped_title = textwrap.fill(title, width=12)
+        # Size 4 is the largest (approx 16-20 chars per line).
+        # Size 2 is standard/readable (approx 32 chars per line).
+        wrapped_title = textwrap.fill(title, width=18)
         
         if notes and notes.lower() != 'none':
-            wrapped_notes = textwrap.fill(notes, width=24)
+            wrapped_notes = textwrap.fill(notes, width=32)
         else:
             wrapped_notes = "No notes"
             
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # ESC/POS commands for Unicode TTF font mode
-        ESC_BIG = "\x1b\x21\x01\x1d\x21\x03"    # Unicode font, Size 3
-        ESC_NORMAL = "\x1b\x21\x01\x1d\x21\x01" # Unicode font, Size 1
+        ESC_BIG = "\x1b\x21\x01\x1d\x21\x04"    # Unicode font, Size 4 (Largest)
+        ESC_NORMAL = "\x1b\x21\x01\x1d\x21\x02" # Unicode font, Size 2 (Standard)
 
         # Construct the print content
         print_content = (
-            f"{ESC_NORMAL}========================\n"
+            f"{ESC_NORMAL}================================\n"
             f"{ESC_BIG}{wrapped_title}\n{ESC_NORMAL}"
-            "------------------------\n"
+            "--------------------------------\n"
             f"{wrapped_notes}\n"
-            "------------------------\n"
+            "--------------------------------\n"
             f"Printed: {time_str}\n"
-            "========================\n"
+            "================================\n"
             "\n" * 6  # Feed spaces so we can tear it off cleanly
         )
+
 
 
 
