@@ -76,8 +76,9 @@ MQTT_BROKER=192.168.1.100
 MQTT_USER=your_mqtt_username
 MQTT_PASSWORD=your_mqtt_password
 
-# Optional - Calendar Integration
+# Optional - Calendar Integration & External Meeting Detection
 CAL_SCRAPER_HOST=http://your-calendar-scraper:8080
+INTERNAL_DOMAINS=mccarthyinternet.net,mcnet
 ```
 
 ## Usage

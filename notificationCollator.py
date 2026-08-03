@@ -18,6 +18,7 @@ import time
 import tempfile
 import json
 import pickle
+import re
 
 
 
@@ -66,6 +67,7 @@ class Config:
     # Calendar Scraper Configuration
     CAL_SCRAPER_HOST = os.environ.get('CAL_SCRAPER_HOST')
     TIMEZONE = os.environ.get('TIMEZONE', 'UTC')
+    INTERNAL_DOMAINS = os.environ.get('INTERNAL_DOMAINS', '')
     LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
     TODOIST_API_TOKEN = os.environ.get('TODOIST_API_TOKEN')
     PRINT_HOST = os.environ.get('PRINT_HOST')
@@ -112,6 +114,12 @@ class Config:
         except ZoneInfoNotFoundError:
             logger.warning(f"Invalid TIMEZONE '{cls.TIMEZONE}', falling back to UTC")
             return ZoneInfo('UTC')
+
+    @classmethod
+    def get_internal_domains(cls) -> List[str]:
+        if not cls.INTERNAL_DOMAINS:
+            return []
+        return [d.strip().lower() for d in cls.INTERNAL_DOMAINS.split(',') if d.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -958,8 +966,10 @@ class CalendarManager:
             self._safe_publish("nextEvent/organizer", self.next_event['eventOrganizer'], qos=1)
 
             # Process attendees if available
+            attendees_text = ""
             if len(event) > 4:
                 attendees = event[4].strip()
+                attendees_text = attendees
                 if len(attendees) > 200:
                     attendees = attendees[:200] + "....."
                 self.next_event['eventAttendees'] = attendees
@@ -967,6 +977,23 @@ class CalendarManager:
 
             # Check for external attendees
             is_external = len(event) > 5 and "EXTATTENDEES" in event[5]
+
+            # Check against internal domains if configured
+            internal_domains = Config.get_internal_domains()
+            if not is_external and internal_domains:
+                search_text = f"{self.next_event.get('eventOrganizer', '')} {attendees_text} {' '.join(event[5:])}"
+                email_domains = re.findall(r'[\w\.-]+@([\w\.-]+)', search_text)
+                for domain in email_domains:
+                    dom_clean = domain.lower().strip()
+                    is_internal = any(
+                        dom_clean == d or dom_clean.endswith('.' + d)
+                        for d in internal_domains
+                    )
+                    if not is_internal:
+                        is_external = True
+                        logger.info(f"External attendee domain detected: {dom_clean}")
+                        break
+
             self.next_event['isExternal'] = is_external
             self._safe_publish("nextEvent/isExternal", is_external, qos=1)
 
