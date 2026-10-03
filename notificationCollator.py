@@ -1407,7 +1407,7 @@ class NotificationCollator:
             return False
 
 
-    async def _log_todoist_time(self, todoist_id: str, update_baseline: bool) -> int:
+    async def _log_todoist_time(self, todoist_id: str, update_baseline: bool, completed: bool = False) -> int:
         """Post a time-spent comment for the active task and return the new
         cumulative total in seconds.
 
@@ -1436,6 +1436,8 @@ class NotificationCollator:
             f"Session: {format_seconds_to_hhmm(session_seconds)} | "
             f"Total: {format_seconds_to_hhmm(total_seconds)} (recorded on {current_time_str})"
         )
+        if completed:
+            comment_content += " | Marked completed"
         posted = await self._add_todoist_comment(todoist_id, comment_content)
         if not posted:
             logger.error(f"Time-spent comment failed to post for task {todoist_id}; total not carried forward")
@@ -1455,7 +1457,7 @@ class NotificationCollator:
     async def _handle_todoist_completed(self, todoist_id: str) -> None:
         # update_baseline=False: the task is being closed, so there's no future
         # session to resume into.
-        await self._log_todoist_time(todoist_id, update_baseline=False)
+        await self._log_todoist_time(todoist_id, update_baseline=False, completed=True)
         await self._complete_todoist_task(todoist_id)
 
     async def _send_devterm_print_command(self) -> None:
