@@ -1458,7 +1458,10 @@ class NotificationCollator:
         # update_baseline=False: the task is being closed, so there's no future
         # session to resume into.
         await self._log_todoist_time(todoist_id, update_baseline=False, completed=True)
-        await self._complete_todoist_task(todoist_id)
+        closed = await self._complete_todoist_task(todoist_id)
+        if closed:
+            self.calendar_manager.handle_todo_select("next")
+            await self.calendar_manager.push_active_todo_baseline()
 
     async def _send_devterm_print_command(self) -> None:
         # System-wide print lock to prevent duplicate print jobs across all processes
