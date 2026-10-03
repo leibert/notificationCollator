@@ -657,6 +657,86 @@ class LEDSignController:
 
 
 # ---------------------------------------------------------------------------
+# Todoist time tracking helpers
+#
+# The physical todo clock (ESP32 firmware) reports/accepts elapsed time as an
+# "HH:MM" string on nextTODO/personal/elapsed. These helpers translate that
+# format to/from seconds and talk to the Todoist comments API so a task's
+# cumulative time-on-task survives across stop/start cycles.
+# ---------------------------------------------------------------------------
+
+_TOTAL_TIME_RE = re.compile(r"Total:\s*(\d{1,4}):(\d{2})")
+
+
+def parse_hhmm_to_seconds(value: str) -> int:
+    """Parse an "HH:MM" clock string (as published by the todo-clock firmware) into seconds."""
+    try:
+        hours_str, minutes_str = value.strip().split(":", 1)
+        return int(hours_str) * 3600 + int(minutes_str) * 60
+    except (ValueError, AttributeError):
+        return 0
+
+
+def format_seconds_to_hhmm(total_seconds: int) -> str:
+    """Format a seconds count as the "HH:MM" string the firmware expects."""
+    total_seconds = max(0, int(total_seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes = remainder // 60
+    return f"{hours:02d}:{minutes:02d}"
+
+
+async def fetch_todoist_comments(task_id: str) -> List[dict]:
+    """Fetch existing comments for a Todoist task."""
+    if not Config.TODOIST_API_TOKEN:
+        logger.error("TODOIST_API_TOKEN is not set in environment")
+        return []
+
+    headers = {"Authorization": f"Bearer {Config.TODOIST_API_TOKEN}"}
+
+    def do_get():
+        response = requests.get(
+            "https://api.todoist.com/api/v1/comments",
+            headers=headers,
+            params={"task_id": task_id},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    try:
+        result = await asyncio.to_thread(do_get)
+    except Exception as e:
+        logger.error(f"Error fetching Todoist comments for task {task_id}: {e}")
+        return []
+
+    if isinstance(result, dict):
+        return result.get("results", []) or []
+    return result or []
+
+
+def extract_total_seconds_from_comments(comments: List[dict]) -> int:
+    """Find the most recently posted "Total: HH:MM" marker among a task's comments."""
+    latest_posted_at = ""
+    latest_total_seconds = 0
+    for comment in comments:
+        content = comment.get("content") or ""
+        match = _TOTAL_TIME_RE.search(content)
+        if not match:
+            continue
+        posted_at = comment.get("posted_at") or comment.get("posted") or ""
+        if posted_at >= latest_posted_at:
+            latest_posted_at = posted_at
+            latest_total_seconds = int(match.group(1)) * 3600 + int(match.group(2)) * 60
+    return latest_total_seconds
+
+
+async def fetch_previous_total_seconds(task_id: str) -> int:
+    """Return the cumulative time already logged for a task, in seconds (0 if none found)."""
+    comments = await fetch_todoist_comments(task_id)
+    return extract_total_seconds_from_comments(comments)
+
+
+# ---------------------------------------------------------------------------
 # Calendar Manager
 # ---------------------------------------------------------------------------
 
@@ -771,16 +851,38 @@ class CalendarManager:
             # _parse_calendar_response already strips the leading timestamp line;
             # do NOT apply a second [1:] slice here (that was a bug that dropped the
             # first real TODO item on every refresh).
-            self.todo_list = self._parse_calendar_response(result.text)
-            self.todo_index = 0
+            new_todo_list = self._parse_calendar_response(result.text)
             self.last_todo_update = datetime.now()
 
+            # A task that has been "started" (sign paused) is actively running on the
+            # hardware — a background refresh must not yank the selection out from
+            # under it. Keep the list up to date, but only move the index/publish
+            # the nextTODO topics when no task is currently running.
+            task_running = not self.led_controller.paused_event.is_set()
+
+            self.todo_list = new_todo_list
             logger.debug(f"Fetched {len(self.todo_list)} TODO items")
+
+            if task_running:
+                # Try to keep todo_index pointing at the still-running task so that
+                # subsequent next/prev commands rotate from the right place once it
+                # stops, but leave the published nextTODO topics untouched.
+                if self.active_todoist_id:
+                    for i, line in enumerate(self.todo_list):
+                        todoist_id, *_ = self._parse_todo_line(line)
+                        if todoist_id == self.active_todoist_id:
+                            self.todo_index = i
+                            break
+                logger.debug("Skipping nextTODO publish on refresh: a task is currently running")
+                return
+
+            self.todo_index = 0
 
             if self.todo_list:
                 try:
+                    previous_todoist_id = self.active_todoist_id
                     todoist_id, title, timestamp, description = self._parse_todo_line(self.todo_list[self.todo_index])
-                    
+
                     self.active_todoist_id = todoist_id
                     self.active_todo_title = title
                     self.active_todo_notes = description
@@ -789,7 +891,10 @@ class CalendarManager:
                     self.client.publish("nextTODO/personal", title)
                     self.client.publish("nextTODO/personal/title", title)
                     self.client.publish("nextTODO/personal/description", description)
-                    
+
+                    if todoist_id != previous_todoist_id:
+                        await self.push_active_todo_baseline()
+
                 except Exception as e:
                     logger.error(f"Failed to publish TODO to MQTT: {e}")
                 logger.debug(f"Published TODO: {self.todo_list[self.todo_index]}")
@@ -801,6 +906,24 @@ class CalendarManager:
         except Exception as e:
             logger.error(f"Error updating personal TODO: {e}")
             logger.debug(f"Full traceback: {traceback.format_exc()}")
+
+    async def push_active_todo_baseline(self) -> None:
+        """Look up how much time is already logged for the active task and push it
+        to nextTODO/personal/elapsed so a future START resumes the clock from there
+        instead of zero. The firmware only accepts this as a baseline while its
+        clock is stopped, so it's safe to call even if a session happens to be
+        running (it will be ignored)."""
+        if not self.active_todoist_id:
+            return
+        try:
+            total_seconds = await fetch_previous_total_seconds(self.active_todoist_id)
+            self.client.publish("nextTODO/personal/elapsed", format_seconds_to_hhmm(total_seconds))
+            logger.debug(
+                f"Pushed resume baseline {format_seconds_to_hhmm(total_seconds)} "
+                f"for task {self.active_todoist_id}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to push todo baseline for task {self.active_todoist_id}: {e}")
 
     def reset_next_event(self) -> None:
         """Reset next event data and publish default values.
@@ -1135,6 +1258,10 @@ class NotificationCollator:
         self.message_processor = MessageProcessor(self.message_queue, self.led_controller)
         self._task_restart_counts: Dict[str, int] = {}
         self.latest_elapsed_time: str = "0"
+        # Set whenever a fresh nextTODO/personal/elapsed update arrives; cleared
+        # right as a stop/completed command comes in so the handler can wait for
+        # the clock's own post-stop reading instead of using a stale cached value.
+        self.elapsed_updated_event = asyncio.Event()
         self.last_print_time: float = 0.0
         self.last_printed_title: str = ""
 
@@ -1280,19 +1407,55 @@ class NotificationCollator:
             return False
 
 
-    async def _handle_todoist_stop(self, todoist_id: str) -> None:
-        elapsed = getattr(self, "latest_elapsed_time", "0")
+    async def _log_todoist_time(self, todoist_id: str, update_baseline: bool) -> int:
+        """Post a time-spent comment for the active task and return the new
+        cumulative total in seconds.
+
+        Waits briefly for a fresh nextTODO/personal/elapsed reading rather than
+        trusting whatever was last cached: the clock publishes its post-stop
+        value as a *separate* MQTT message right after the stop/completed
+        command itself, so reading the cached value immediately on receipt of
+        that command almost always picks up a stale (up to 10s old) periodic
+        reading instead of the true session length.
+        """
+        if self.loop and self.loop.is_running():
+            try:
+                await asyncio.wait_for(self.elapsed_updated_event.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Timed out waiting for a fresh elapsed-time reading for task {todoist_id}; "
+                    "using the last known value, which may be stale."
+                )
+
+        session_seconds = parse_hhmm_to_seconds(getattr(self, "latest_elapsed_time", "0"))
+        previous_total_seconds = await fetch_previous_total_seconds(todoist_id)
+        total_seconds = previous_total_seconds + session_seconds
+
         current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        comment_content = f"Time spent: {elapsed} (recorded on {current_time_str})"
-        
-        await self._add_todoist_comment(todoist_id, comment_content)
+        comment_content = (
+            f"Session: {format_seconds_to_hhmm(session_seconds)} | "
+            f"Total: {format_seconds_to_hhmm(total_seconds)} (recorded on {current_time_str})"
+        )
+        posted = await self._add_todoist_comment(todoist_id, comment_content)
+        if not posted:
+            logger.error(f"Time-spent comment failed to post for task {todoist_id}; total not carried forward")
+            return previous_total_seconds
+
+        if update_baseline:
+            try:
+                self.mqtt_client.publish("nextTODO/personal/elapsed", format_seconds_to_hhmm(total_seconds))
+            except Exception as e:
+                logger.error(f"Failed to publish updated elapsed baseline for task {todoist_id}: {e}")
+
+        return total_seconds
+
+    async def _handle_todoist_stop(self, todoist_id: str) -> None:
+        await self._log_todoist_time(todoist_id, update_baseline=True)
 
     async def _handle_todoist_completed(self, todoist_id: str) -> None:
-        elapsed = getattr(self, "latest_elapsed_time", "0")
-        current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        comment_content = f"Time spent: {elapsed} (recorded on {current_time_str})"
-        
-        await self._add_todoist_comment(todoist_id, comment_content)
+        # update_baseline=False: the task is being closed, so there's no future
+        # session to resume into.
+        await self._log_todoist_time(todoist_id, update_baseline=False)
         await self._complete_todoist_task(todoist_id)
 
     async def _send_devterm_print_command(self) -> None:
@@ -1622,6 +1785,9 @@ if __name__ == '__main__':
         todoist_id = self._get_current_todoist_id()
         if todoist_id:
             if self.loop and self.loop.is_running():
+                # Clear first so _handle_todoist_stop waits for the clock's fresh
+                # post-stop elapsed reading instead of a stale cached one.
+                self.loop.call_soon_threadsafe(self.elapsed_updated_event.clear)
                 asyncio.run_coroutine_threadsafe(self._handle_todoist_stop(todoist_id), self.loop)
             else:
                 logger.error("Cannot handle Todoist stop: asyncio event loop is not running")
@@ -1634,12 +1800,22 @@ if __name__ == '__main__':
         todoist_id = self._get_current_todoist_id()
         if todoist_id:
             if self.loop and self.loop.is_running():
+                self.loop.call_soon_threadsafe(self.elapsed_updated_event.clear)
                 asyncio.run_coroutine_threadsafe(self._handle_todoist_completed(todoist_id), self.loop)
             else:
                 logger.error("Cannot handle Todoist completed: asyncio event loop is not running")
         else:
             logger.warning("No currently selected todoist ID found to complete.")
 
+
+    def _schedule_todo_baseline_push(self) -> None:
+        """Schedule pushing the newly-active task's logged total as the clock's
+        resume baseline. Called after a next/prev rotation, which happens
+        synchronously on the MQTT thread and can't await the Todoist lookup itself."""
+        if self.loop and self.loop.is_running():
+            asyncio.run_coroutine_threadsafe(self.calendar_manager.push_active_todo_baseline(), self.loop)
+        else:
+            logger.error("Cannot push todo baseline: asyncio event loop is not running")
 
     def _on_mqtt_message(self, client, userdata, msg):
         """General MQTT message handler for subscribed commands"""
@@ -1657,6 +1833,7 @@ if __name__ == '__main__':
                 self._handle_completed()
             else:
                 self.calendar_manager.handle_todo_select(payload)
+                self._schedule_todo_baseline_push()
         elif topic == "nextTODO/select/start":
             self._handle_start()
         elif topic == "nextTODO/select/stop":
@@ -1666,6 +1843,8 @@ if __name__ == '__main__':
         elif topic == "nextTODO/personal/elapsed":
             self.latest_elapsed_time = payload
             logger.debug(f"Updated latest elapsed time: {payload!r}")
+            if self.loop and self.loop.is_running():
+                self.loop.call_soon_threadsafe(self.elapsed_updated_event.set)
         else:
             logger.debug(f"No handler for topic {topic!r}")
 
