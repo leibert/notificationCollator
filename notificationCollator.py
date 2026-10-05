@@ -1460,8 +1460,7 @@ class NotificationCollator:
         await self._log_todoist_time(todoist_id, update_baseline=False, completed=True)
         closed = await self._complete_todoist_task(todoist_id)
         if closed:
-            self.calendar_manager.handle_todo_select("next")
-            await self.calendar_manager.push_active_todo_baseline()
+            await self.calendar_manager.update_todos()
 
     async def _send_devterm_print_command(self) -> None:
         # System-wide print lock to prevent duplicate print jobs across all processes
